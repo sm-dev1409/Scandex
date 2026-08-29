@@ -29,6 +29,40 @@ from .models import Holding, HoldingsSummary, Party
 # The Holding interface id. Using a TemplateFilter here silently returns [].
 HOLDING_INTERFACE = "#splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding"
 
+# The Splice token-standard TransferInstruction interface id. Offer-style
+# transfers surface as TransferInstruction contracts (created = pending offer,
+# archived = accepted/rejected/withdrawn). We poll for these alongside Holdings
+# so the scanner can detect stale/pending transfers (challenge A2).
+#
+# TODO: verify against DevNet. This id follows the same naming pattern as
+# HOLDING_INTERFACE (package "#splice-api-token-transfer-instruction-v1",
+# module "Splice.Api.Token.TransferInstructionV1", entity "TransferInstruction"),
+# but with no C8_CLIENT_SECRET available it has NOT been confirmed against a live
+# registry.info() / active-contracts response. Correct it if the live view
+# reports a different interface id.
+TRANSFER_INSTRUCTION_INTERFACE = (
+    "#splice-api-token-transfer-instruction-v1:"
+    "Splice.Api.Token.TransferInstructionV1:TransferInstruction"
+)
+
+
+def holding_interface_filter() -> dict:
+    """The ``cumulative`` entry that asks for the Holding interface view."""
+    return {"identifierFilter": {"InterfaceFilter": {"value": {
+        "interfaceId": HOLDING_INTERFACE,
+        "includeInterfaceView": True,
+        "includeCreatedEventBlob": False,
+    }}}}
+
+
+def transfer_instruction_interface_filter() -> dict:
+    """The ``cumulative`` entry that asks for the TransferInstruction view."""
+    return {"identifierFilter": {"InterfaceFilter": {"value": {
+        "interfaceId": TRANSFER_INSTRUCTION_INTERFACE,
+        "includeInterfaceView": True,
+        "includeCreatedEventBlob": False,
+    }}}}
+
 
 class LedgerClient:
     def __init__(self, config, auth: Authenticator, http: HttpClient | None = None):
@@ -124,17 +158,16 @@ class LedgerClient:
         POST batch queries when ``endInclusive`` is set - which is exactly the
         polling shape we want for a stdlib-only indexer.
 
-        ``filters`` defaults to the same ``Holding`` interface filter used by
-        :meth:`holdings`, so a Holding created or archived anywhere in the tree
-        shows up with its interface view populated.
+        ``filters`` defaults to **both** the ``Holding`` and the
+        ``TransferInstruction`` interface filters, so a Holding created/archived
+        *and* a TransferInstruction offer created/archived anywhere in the tree
+        show up with their interface views populated. The Holding filter is
+        first so callers that only introspect ``cumulative[0]`` still see it.
         """
-        cumulative = filters if filters is not None else [{
-            "identifierFilter": {"InterfaceFilter": {"value": {
-                "interfaceId": HOLDING_INTERFACE,
-                "includeInterfaceView": True,
-                "includeCreatedEventBlob": False,
-            }}}
-        }]
+        cumulative = filters if filters is not None else [
+            holding_interface_filter(),
+            transfer_instruction_interface_filter(),
+        ]
         body = {
             "beginExclusive": begin_exclusive,
             "endInclusive": end_inclusive,
@@ -156,13 +189,7 @@ class LedgerClient:
         """
         if offset is None:
             offset = self.ledger_end()
-        interface_filter = [{
-            "identifierFilter": {"InterfaceFilter": {"value": {
-                "interfaceId": HOLDING_INTERFACE,
-                "includeInterfaceView": True,
-                "includeCreatedEventBlob": False,
-            }}}
-        }]
+        interface_filter = [holding_interface_filter()]
         entries = self.active_contracts(party, offset, interface_filter)
         holdings: list[Holding] = []
         for item in entries:
