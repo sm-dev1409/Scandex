@@ -291,15 +291,24 @@ def _run_history(cfg, args) -> int:
     if not rows:
         print("  (no transfers recorded for this party yet)")
         return 0
-    print(f"  {'when':<28} {'kind':<7} {'status':<9} {'instrument':<12} "
+    print(f"  {'when (UTC)':<19} {'kind':<7} {'status':<9} {'instrument':<12} "
           f"{'amount':>12} {'counterparty':<24} update_id")
     for r in rows:
         counterparty = r["receiver"] if r["sender"] == party else r["sender"]
         counterparty = (counterparty or "?")[:24]
-        print(f"  {(r['recorded_at'] or ''):<28} {(r['transfer_kind'] or '?'):<7} "
+        print(f"  {_short_time(r['recorded_at']):<19} {(r['transfer_kind'] or '?'):<7} "
               f"{(r['status'] or '?'):<9} {(r['instrument'] or '?'):<12} "
               f"{(r['amount'] or ''):>12} {counterparty:<24} {r['update_id'] or ''}")
     return 0
+
+
+def _short_time(value: str | None) -> str:
+    """ScannerDB stores full ISO-8601 with microseconds and a UTC offset, which
+    is right for the API but 32 characters wide in a terminal table. Trim to
+    seconds for display only."""
+    if not value:
+        return ""
+    return value.replace("T", " ")[:19]
 
 
 def _run_serve(cfg, args) -> int:
