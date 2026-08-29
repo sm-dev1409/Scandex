@@ -1,110 +1,46 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import './Dashboard.css'
+import {
+  API_BASE,
+  fetchBalances,
+  fetchHealth,
+  fetchMetrics,
+  fetchParties,
+  fetchStale,
+  fetchTransfers,
+} from './api.js'
+import {
+  breakdown,
+  fmt,
+  isStalePending,
+  partyLabel,
+  relativeTime,
+  shortParty,
+  summarise,
+} from './format.js'
 
-// Canton scanner dashboard — reads the Scandex API (api_server.py) and shows
-// the selected party's per-instrument balances and transfer history.
+// Canton scanner dashboard — reads the Scandex local JSON API (webapi.py) and
+// shows the selected party's per-instrument balances, transfer history and
+// scanner metrics.
 //
-// /health is still polled, but only to drive the status chip in the topbar —
-// none of its counts are rendered.
+// All HTTP and all response-envelope unwrapping lives in api.js; all pure
+// formatting lives in format.js. This file is the component only.
 //
 // Every field rendered below comes from store.py's documented return shapes.
 // The two things the API does NOT give us, and that we derive here instead:
 //
-//   • transfer direction — the rows carry sender/receiver, not a direction
-//     flag, so we compare them against the selected party.
+//   • transfer direction per row — the rows carry sender/receiver, not a
+//     direction flag, so we compare them against the selected party.
 //   • connected/stale — /health has no boolean for this, so we age
 //     last_updated against the wall clock.
 //
-// The server sets CORS to allow_origins=["*"], so no proxy is needed from the
-// Vite dev server.
+// The server sets Access-Control-Allow-Origin: *, so no dev proxy is needed.
 
-const API = 'http://localhost:8000'
 const POLL_MS = 1500
 const TRANSFER_LIMIT = 50
 // The scanner checkpoints on every batch; a gap this long means it stopped.
 const STALE_MS = 10000
-
-async function getJSON(url) {
-  const res = await fetch(url)
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return res.json()
-}
-
-// `now` is passed in rather than read from the clock so rendering stays a pure
-// function of state — the 1s tick below is what advances it.
-function relativeTime(value, now) {
-  const then = typeof value === 'number' ? value : new Date(value).getTime()
-  if (Number.isNaN(then)) return value
-  const secs = Math.max(0, Math.round((now - then) / 1000))
-  if (secs < 60) return `${secs}s ago`
-  if (secs < 3600) return `${Math.floor(secs / 60)}m ago`
-  if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`
-  return new Date(then).toLocaleString()
-}
-
-function fmt(n) {
-  return typeof n === 'number' ? n.toLocaleString() : n
-}
-
-function partyLabel(p) {
-  return p.display_name || p.party_id
-}
-
-// Canton party ids are "<hint>::<fingerprint>". The fingerprint is noise in a
-// table row, so show the hint (or the known display_name) and keep the full id
-// on the title attribute.
-function shortParty(partyId, partyMap) {
-  if (!partyId) return '—'
-  const known = partyMap.get(partyId)
-  if (known?.display_name) return known.display_name
-  const hint = partyId.split('::')[0]
-  return hint || partyId
-}
-
-// Amounts are per-instrument, so they are summed per-instrument and never
-// added across instruments — "1,200 Amulet + 40 c8ETH" is not a number.
-function summarise(transfers, party) {
-  const byInstrument = new Map()
-  let inCount = 0
-  let outCount = 0
-
-  for (const t of transfers) {
-    const amt = Number(t.amount) || 0
-    const outgoing = t.sender === party
-    const entry = byInstrument.get(t.instrument) ?? { received: 0, sent: 0 }
-    if (outgoing) {
-      entry.sent += amt
-      outCount += 1
-    } else {
-      entry.received += amt
-      inCount += 1
-    }
-    byInstrument.set(t.instrument, entry)
-  }
-
-  const instruments = [...byInstrument.keys()].sort()
-  return {
-    byInstrument,
-    instruments,
-    inCount,
-    outCount,
-    // With exactly one instrument in view the stat cards can show a real
-    // amount; with several they fall back to counts plus a per-instrument
-    // breakdown underneath.
-    single: instruments.length === 1 ? instruments[0] : null,
-  }
-}
-
-function breakdown(stats, pick) {
-  if (stats.instruments.length === 0) return 'No transfers'
-  return stats.instruments
-    .map((i) => {
-      const e = stats.byInstrument.get(i)
-      const v = pick(e)
-      return `${v > 0 ? '+' : ''}${fmt(Number(v.toFixed(4)))} ${i}`
-    })
-    .join(' · ')
-}
 
 export default function Dashboard() {
   const [parties, setParties] = useState([])
@@ -113,6 +49,11 @@ export default function Dashboard() {
   const [balances, setBalances] = useState([]) // last known good
   const [transfers, setTransfers] = useState([]) // last known good
   const [health, setHealth] = useState(null)
+  const [metrics, setMetrics] = useState(null)
+  // update_ids the server itself considers stale, so a row badge agrees with
+  // GET /tokens/transfers/stale rather than being a second opinion.
+  const [staleIds, setStaleIds] = useState(() => new Set())
+  const [staleSeconds, setStaleSeconds] = useState(300)
 
   const [instrument, setInstrument] = useState('') // '' = all
   const [direction, setDirection] = useState('') // '' = both
@@ -133,9 +74,8 @@ export default function Dashboard() {
 
     async function load() {
       try {
-        const list = await getJSON(`${API}/parties`)
+        const rows = await fetchParties()
         if (!alive) return
-        const rows = Array.isArray(list) ? list : []
         if (rows.length === 0) return
         setParties(rows)
         // Default to a local party — that's the one this scanner runs as.
@@ -166,24 +106,28 @@ export default function Dashboard() {
     let alive = true
     let flashTimer
 
-    const path = encodeURIComponent(selectedParty)
-    const query = new URLSearchParams({ limit: String(TRANSFER_LIMIT) })
-    if (instrument) query.set('instrument', instrument)
-    if (direction) query.set('direction', direction)
-
     async function poll() {
       try {
-        const [bal, hist, hp] = await Promise.all([
+        const [bal, hist, hp, mt, st] = await Promise.all([
           // Balances stay unfiltered so the instrument dropdown below always
           // has the party's full instrument list to offer.
-          getJSON(`${API}/tokens/balance/${path}`),
-          getJSON(`${API}/tokens/transfers/${path}?${query}`),
-          getJSON(`${API}/health`),
+          fetchBalances(selectedParty),
+          fetchTransfers(selectedParty, {
+            limit: TRANSFER_LIMIT,
+            instrument,
+            direction,
+          }),
+          fetchHealth(),
+          fetchMetrics(),
+          fetchStale(),
         ])
         if (!alive) return
-        setBalances(Array.isArray(bal) ? bal : [])
-        setTransfers(Array.isArray(hist) ? hist : [])
+        setBalances(bal)
+        setTransfers(hist)
         setHealth(hp)
+        setMetrics(mt)
+        setStaleIds(new Set(st.transfers.map((t) => t.update_id)))
+        if (st.olderThanSeconds != null) setStaleSeconds(st.olderThanSeconds)
         setLastUpdated(Date.now())
         setOnline(true)
         setLoading(false)
@@ -242,10 +186,14 @@ export default function Dashboard() {
             ? { tone: 'chip-neg', text: 'Scanner stale' }
             : { tone: 'chip-pos', text: 'Live' }
 
+  // Reported by the server (/health.data_mode), never guessed from the port —
+  // so a fabricated demo number can never be mistaken for ledger data.
+  const dataMode = health?.data_mode
+
   const emptyText = !loading
     ? 'No transfers match these filters.'
     : online === false
-      ? `Waiting for the backend at ${API}`
+      ? `Waiting for the backend at ${API_BASE}`
       : 'Loading…'
 
   return (
@@ -278,6 +226,19 @@ export default function Dashboard() {
             </select>
           </label>
 
+          {dataMode && (
+            <span
+              className={`chip ${dataMode === 'test' ? 'chip-warn' : 'chip-mute'}`}
+              title={
+                dataMode === 'test'
+                  ? 'Fabricated demo data seeded by demo_data.py — not ledger data.'
+                  : 'Serving data the indexer read from the Cantor8 ledger.'
+              }
+            >
+              Data mode: {dataMode.toUpperCase()}
+            </span>
+          )}
+
           {lastUpdated && (
             <span className="synced">
               Polled {relativeTime(lastUpdated, now)}
@@ -287,6 +248,9 @@ export default function Dashboard() {
             <span className="dot" />
             {statusChip.text}
           </span>
+          <Link className="btn-link" to="/status">
+            Status
+          </Link>
         </div>
       </header>
 
@@ -400,12 +364,105 @@ export default function Dashboard() {
           </div>
         </section>
 
+        {/* Scanner metrics (challenge P9). Every number here comes from
+            GET /metrics — none of it is recomputed client-side from the
+            transfer list, which only holds the newest TRANSFER_LIMIT rows for
+            one party and so could not produce network-wide totals. */}
+        <section className="card span-12">
+          <div className="panel-head">
+            <h2 className="panel-title">Scanner metrics</h2>
+            <span className="chip chip-mute">GET /metrics</span>
+          </div>
+
+          {!metrics ? (
+            <p className="empty">{online === false ? 'Backend unreachable' : 'Loading…'}</p>
+          ) : (
+            <>
+              <div className="metric-grid">
+                <div className="metric">
+                  <span className="metric-label">Total transfers</span>
+                  <span className="metric-value">{fmt(metrics.total_transfers)}</span>
+                </div>
+                <div className="metric">
+                  <span className="metric-label">Tracked parties</span>
+                  <span className="metric-value">{fmt(metrics.tracked_parties)}</span>
+                </div>
+                <div className="metric">
+                  <span className="metric-label">Active holdings</span>
+                  <span className="metric-value">{fmt(metrics.active_holdings)}</span>
+                </div>
+                <div className="metric">
+                  <span className="metric-label">Stale pending</span>
+                  <span
+                    className={
+                      metrics.stale_pending_transfers > 0
+                        ? 'metric-value neg'
+                        : 'metric-value'
+                    }
+                  >
+                    {fmt(metrics.stale_pending_transfers)}
+                  </span>
+                </div>
+                <div className="metric">
+                  <span className="metric-label">Scanner delay</span>
+                  <span className="metric-value">
+                    {metrics.scanner_delay_offsets == null
+                      ? '—'
+                      : `${fmt(metrics.scanner_delay_offsets)} offsets`}
+                  </span>
+                </div>
+              </div>
+
+              <div className="metric-cols">
+                <div>
+                  <h3 className="metric-sub">Volume by instrument</h3>
+                  {metrics.volume_by_instrument?.length ? (
+                    <ul className="metric-list">
+                      {metrics.volume_by_instrument.map((v) => (
+                        <li key={v.instrument}>
+                          <span>{v.instrument}</span>
+                          <span>
+                            {fmt(Number(Number(v.volume).toFixed(4)))}
+                            <span className="metric-count"> · {fmt(v.count)}</span>
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="empty">No transfer volume yet</p>
+                  )}
+                </div>
+
+                <div>
+                  <h3 className="metric-sub">Locked by instrument</h3>
+                  {metrics.locked_by_instrument?.length ? (
+                    <ul className="metric-list">
+                      {metrics.locked_by_instrument.map((v) => (
+                        <li key={v.instrument}>
+                          <span>{v.instrument}</span>
+                          <span>
+                            {fmt(Number(Number(v.locked_total).toFixed(4)))}
+                            <span className="metric-count"> · {fmt(v.count)}</span>
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="empty">Nothing locked</p>
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+        </section>
+
         <section className="card span-12">
           <div className="panel-head">
             <h2 className="panel-title">Transfers</h2>
             <div className="panel-tools">
               {/* instrument and direction are real optional query params on
-                  GET /tokens/transfers/{party} — the server filters, not us. */}
+                  GET /tokens/transfers/{party} — the server filters in SQL
+                  before LIMIT, so we never post-filter a truncated page. */}
               <select
                 className="select select-sm"
                 value={instrument}
@@ -471,6 +528,7 @@ export default function Dashboard() {
                   const outgoing = t.sender === selectedParty
                   const dir = outgoing ? 'out' : 'in'
                   const other = outgoing ? t.receiver : t.sender
+                  const isStale = isStalePending(t, now, staleSeconds, staleIds)
                   return (
                     // One update_id can produce several transfer rows, so the
                     // key has to include position to stay unique.
@@ -488,6 +546,21 @@ export default function Dashboard() {
                         <span title={other}>{shortParty(other, partyMap)}</span>
                       </span>
                       <span className="row-kind">{t.transfer_kind}</span>
+                      {/* A pending offer past the stale threshold is the A2
+                          drift case — badge it instead of leaving "pending" as
+                          plain text indistinguishable from a settled row. */}
+                      {isStale ? (
+                        <span
+                          className="chip chip-neg"
+                          title={`Still pending after ${staleSeconds}s — the offer may never settle.`}
+                        >
+                          stale pending
+                        </span>
+                      ) : t.status && t.status !== 'settled' ? (
+                        <span className="chip chip-warn">{t.status}</span>
+                      ) : (
+                        <span className="row-status-ok">{t.status}</span>
+                      )}
                       <span className="row-time" title={`${t.recorded_at} · offset ${t.ledger_offset}`}>
                         {relativeTime(t.recorded_at, now)}
                       </span>

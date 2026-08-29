@@ -628,3 +628,163 @@
   .bal-grid { grid-template-columns: 1fr; }
   .select { max-width: 180px; }
 }
+
+/* ---------- full-stack integration additions ----------
+   Styles for the metrics panel, the scanner status page, the data-mode
+   banner, and the stale-pending badge on a transfer row. */
+
+.chip-warn { color: var(--warn); background: var(--warn-bg); }
+
+.span-6 { grid-column: span 6; }
+
+@media (max-width: 900px) {
+  .span-6 { grid-column: span 12; }
+}
+
+/* A plain text link styled to sit next to the topbar chips. */
+.btn-link {
+  padding: 6px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.btn-link:hover { color: var(--text); border-color: var(--muted); }
+
+/* ---------- metrics panel (P9) ---------- */
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 14px;
+  margin-top: 18px;
+}
+
+.metric {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel-alt);
+}
+
+.metric-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.metric-value { font-size: 22px; font-weight: 700; }
+.metric-value.neg { color: var(--neg); }
+
+.metric-cols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 22px;
+  margin-top: 22px;
+}
+
+.metric-sub {
+  margin: 0 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.metric-list { list-style: none; margin: 0; padding: 0; }
+
+.metric-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+  font-variant-numeric: tabular-nums;
+}
+
+.metric-list li:last-child { border-bottom: none; }
+.metric-count { color: var(--muted-dim); }
+
+/* ---------- status page (P7) ---------- */
+
+.mode-banner {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 22px;
+  flex-wrap: wrap;
+}
+
+/* The border carries the signal, so TEST vs REAL is distinguishable without
+   relying on colour alone (the word is spelled out right next to it). */
+.mode-banner.mode-test { border-color: var(--warn); }
+.mode-banner.mode-real { border-color: var(--pos); }
+
+.mode-value {
+  font-size: 30px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  margin: 4px 0 8px;
+}
+
+.mode-test .mode-value { color: var(--warn); }
+.mode-real .mode-value { color: var(--pos); }
+
+.mode-note {
+  margin: 0;
+  max-width: 68ch;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.mode-base {
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-alt);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.status-list { list-style: none; margin: 16px 0 0; padding: 0; }
+
+.status-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.status-row:last-child { border-bottom: none; }
+
+.status-label { color: var(--muted); font-size: 13px; }
+
+.status-value {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  text-align: right;
+  word-break: break-all;
+}
+
+.status-note {
+  margin: 12px 0 0;
+  color: var(--muted-dim);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* A settled row still shows its status, just quietly — the badge is reserved
+   for anything that is not settled. */
+.row-status-ok { color: var(--muted-dim); font-size: 12px; }

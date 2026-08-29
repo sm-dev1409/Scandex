@@ -26,6 +26,10 @@
   --pos-bg: rgba(52, 211, 153, 0.12);
   --neg: #f87171;
   --neg-bg: rgba(248, 113, 113, 0.12);
+  /* Amber: "needs attention, not yet an error" — the TEST data-mode
+     badge and non-settled transfer statuses. */
+  --warn: #fbbf24;
+  --warn-bg: rgba(251, 191, 36, 0.12);
 
   --radius: 16px;
   --radius-sm: 12px;
