@@ -18,9 +18,11 @@ History note: this module supersedes the earlier ``db.py`` (class ``Database``).
 Two pieces of ``db.py`` were carried forward here rather than dropped:
 
 * an idempotent transfer insert — ``UNIQUE(update_id, sender, receiver,
-  instrument, amount)`` on ``transfers``, so replaying an already-processed
-  offset range never double-counts. ``save_transfer`` swallows the resulting
-  ``IntegrityError`` and returns ``False`` for "not newly inserted";
+  instrument, amount)`` on ``transfers``, plus the NULL-safe ``idx_transfers_dedupe``
+  expression index that also covers the indexer's per-leg rows (which carry a
+  NULL sender or receiver), so replaying an already-processed offset range never
+  double-counts. ``save_transfer`` swallows the resulting ``IntegrityError`` and
+  returns ``False`` for "not newly inserted";
 * a ``status`` column on ``transfers`` (``settled`` / ``pending`` /
   ``resolved`` …) used by the stale-transfer detection.
 
@@ -53,10 +55,10 @@ HOLDING_INTERFACE = (
 
 # Bump when the tables change. v2 added the transfers UNIQUE constraint,
 # ``status`` / ``source`` / ``scanner_delay_secs`` / ``contract_id`` columns
-# (ported from db.py), so a fresh DB is required after the reconciliation —
-# use ``ScannerDB(path).reset()`` on any stale v1 file left from store.py's
-# standalone era.
-SCHEMA_VERSION = 2
+# (ported from db.py). v3 added the NULL-safe dedupe index below. A fresh DB is
+# required after the reconciliation — use ``ScannerDB(path).reset()`` on any
+# stale file left from store.py's standalone era or from db.py.
+SCHEMA_VERSION = 3
 
 # Default age past which a still-``pending`` transfer is considered stale.
 DEFAULT_STALE_SECONDS = 300
@@ -185,6 +187,31 @@ CREATE INDEX IF NOT EXISTS idx_events_party
     ON ledger_events (party_id);
 """
 
+# The NULL-safe half of the idempotent transfer insert (schema v3).
+#
+# The table-level UNIQUE(update_id, sender, receiver, instrument, amount) only
+# fires when every one of those columns is non-NULL, because SQLite treats NULLs
+# as distinct in a UNIQUE index. The indexer's per-leg rows deliberately carry a
+# NULL sender (a credit) or a NULL receiver (a debit), so that constraint alone
+# never deduplicated them — replaying an offset range after a crash between
+# recording a transfer and saving the checkpoint double-counted every leg.
+#
+# This expression index closes that hole: it compares the same identity with
+# NULLs coalesced to ''. ``contract_id`` is included because a per-leg row is
+# about one specific holding contract — without it, one update legitimately
+# crediting the same party twice for the same amount (two separate contracts)
+# would be collapsed into a single row.
+DEDUPE_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_transfers_dedupe ON transfers (
+    COALESCE(update_id, ''),
+    COALESCE(contract_id, ''),
+    COALESCE(sender, ''),
+    COALESCE(receiver, ''),
+    COALESCE(instrument, ''),
+    COALESCE(amount, '')
+);
+"""
+
 
 # ═══════════════════════════════════════════════
 # HELPERS
@@ -256,6 +283,17 @@ class ScannerDB:
         """
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        try:
+            self.conn.executescript(DEDUPE_INDEX)
+        except sqlite3.IntegrityError as exc:
+            # Only reachable on a pre-v3 file that already contains duplicate
+            # transfer legs. Say so plainly instead of failing on open.
+            raise sqlite3.IntegrityError(
+                f"{self.path} predates schema v{SCHEMA_VERSION} and already "
+                "contains duplicate transfer rows, so the idempotency index "
+                "cannot be created. Delete the file (or call "
+                "ScannerDB.reset()) and re-run the indexer to rebuild it."
+            ) from exc
         existing = self.conn.execute(
             "SELECT version FROM schema_version"
         ).fetchone()
@@ -360,12 +398,15 @@ class ScannerDB:
     ) -> bool:
         """Record a parsed transfer. Returns ``True`` if a new row was written.
 
-        The ``UNIQUE(update_id, sender, receiver, instrument, amount)``
-        constraint makes this idempotent for fully-identified transfers:
-        replaying the same update never double-counts. (SQLite treats NULLs as
-        distinct in a UNIQUE index, so a per-leg row with a NULL sender *or*
-        receiver is deduplicated only by the holding upsert being idempotent,
-        not by this constraint — the same behaviour db.py had.)
+Idempotent: replaying the same update never double-counts. Two
+        constraints cover it — the table's ``UNIQUE(update_id, sender,
+        receiver, instrument, amount)`` for fully-identified transfers, and
+        ``idx_transfers_dedupe`` (NULL-coalesced, and including
+        ``contract_id``) for the indexer's per-leg rows, which carry a NULL
+        sender or receiver and so slip past a plain UNIQUE.
+
+        Pass ``contract_id`` for a per-leg row too, not just for an offer: it
+        is what keeps two legitimate same-amount legs in one update distinct.
 
         Args:
             transfer_kind: 'credit' / 'debit' (per-leg Holding events),

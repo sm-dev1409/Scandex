@@ -270,11 +270,14 @@ class Indexer:
                 party_id=owner,
             )
             stats.holdings_created += 1
+            # contract_id is part of the per-leg dedupe identity: it is what
+            # distinguishes two same-amount credits in one update from a replay
+            # of the same one. See store.DEDUPE_INDEX.
             if self.db.save_transfer(
                 update_id=update_id, sender=None, receiver=owner,
                 amount=holding["amount"], instrument=holding["instrument"],
                 transfer_kind="credit", ledger_offset=update_offset,
-                status="settled", source="ledger",
+                status="settled", source="ledger", contract_id=contract_id,
             ):
                 stats.transfers_recorded += 1
             return
@@ -326,7 +329,7 @@ class Indexer:
                 update_id=update_id, sender=row["party_id"], receiver=None,
                 amount=row["amount"], instrument=row["instrument"],
                 transfer_kind="debit", ledger_offset=update_offset,
-                status="settled", source="ledger",
+                status="settled", source="ledger", contract_id=contract_id,
             ):
                 stats.transfers_recorded += 1
             return

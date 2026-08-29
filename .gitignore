@@ -8,3 +8,9 @@ __pycache__/
 reports/*.json
 !reports/.gitkeep
 .daml/
+
+# Local scanner databases (the indexer rebuilds these; never commit one).
+scandex.db
+*.db
+*.db-wal
+*.db-shm
