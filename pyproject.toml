@@ -19,6 +19,9 @@ dev = ["pytest>=7.0"]
 
 [project.scripts]
 check-cantor8 = "scandex_api.cli:main"
+# The local JSON API the frontend calls. Also reachable without installing,
+# via `python scripts/serve_api.py` or `check_cantor8.py --serve`.
+serve-scandex-api = "scandex_api.webapi:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
