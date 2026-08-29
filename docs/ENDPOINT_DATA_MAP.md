@@ -5,6 +5,14 @@ data it yields, and how that maps onto a Scandex database. This is the catalogue
 the diagnostic checks against; `python scripts/check_cantor8.py --write-report`
 emits the live PASS/FAIL status of these same endpoints alongside it.
 
+Two directions are catalogued here, and they are easy to confuse because some
+route names coincide:
+
+- **Inbound (most of this file):** what Scandex *reads from Cantor8* - the
+  Ledger API, the token registry, Cantor8's scanner, and the public Scan API.
+- **Outbound (the "Local API" section):** what Scandex *serves to its own
+  frontend* on localhost, out of the database the indexer filled.
+
 **Nothing here is a claim of live coverage.** Endpoints the diagnostic does not
 exercise are labelled. Write and streaming endpoints are catalogued but **never
 executed** by the diagnostic — see the "Not tested / manual only" section.
@@ -28,8 +36,8 @@ truth.
 - **Question it answers:** "Is the ledger reachable, and what is the current
   offset to read a consistent snapshot at?"
 - **Important response fields:** `offset`.
-- **Proposed table(s):** `ledger_offsets`.
-- **Proposed fields:** `offset`, `observed_at`, `source='ledger'`.
+- **Table written:** `checkpoint` (one row: the resume bookmark).
+- **Fields:** `last_offset`, `updated_at`.
 - **Future Scandex feature:** connectivity check; the resume point for an
   indexer (save the offset, restart from it, don't re-read everything).
 - **Why selected:** cheapest health check and the anchor for every consistent
@@ -60,10 +68,11 @@ truth.
 - **Important response fields:** contract id, template/interface id, amount,
   `instrumentId.id`, `instrumentId.admin`, `lock` (present ⇒ locked), lock
   `expiresAt`, created event info.
-- **Proposed table(s):** `holdings`, `contracts`.
-- **Proposed fields (`holdings`):** `contract_id` (PK), `party_id`, `amount`,
-  `instrument_id`, `administrator`, `locked`, `lock_expiry`, `read_at_offset`,
-  `observed_at`.
+- **Table written:** `holdings`.
+- **Fields:** `contract_id` (PK), `party_id`, `amount`, `instrument`, `admin`,
+  `locked`, `active`, `created_at_offset`, `archived_at_offset`, `created_at`,
+  `archived_at`. (`lock_expiry` is read from the interface view but not yet
+  persisted - only the boolean `locked` is.)
 - **Future feature:** portfolio view, spendable-balance calculation, asset list,
   the A1 scanner's balance layer.
 - **Why selected:** this is the balance. Everything Scandex shows about holdings
@@ -85,7 +94,9 @@ truth.
 - **Auth:** token + act-as rights. **Demo need:** optional (write path).
 - **Question:** "Commit a command (a transfer, an accept) and block until done."
 - **Important response fields:** transaction id, completion status, errors.
-- **Proposed table(s):** `transfers`, `raw_api_responses`.
+- **Proposed table(s):** `transfers` — though a scanner never needs this: the
+  indexer records a transfer when it *observes* the resulting events on the
+  ledger, not when a command is submitted.
 - **Future feature:** actually moving value — a separate, human-approved action.
 - **Why catalogued:** so the shape is documented and a test asserts the
   diagnostic never calls it.
@@ -99,7 +110,8 @@ truth.
 - **Important response fields:** per update, `TransactionTree.updateId`,
   `TransactionTree.offset`, `TransactionTree.eventsById` (a map of node-id →
   `CreatedTreeEvent` / `ExercisedTreeEvent`).
-- **Tables written:** `ledger_offsets`, `holdings`, `transfers`.
+- **Tables written:** `checkpoint`, `holdings`, `transfers`, `ledger_events`,
+  `parties`.
 - **Feature backed:** [A1 scanner](#a1-scanner-implementation) — reads the ACS
   first for the present, then polls this endpoint forward from that same
   offset to stay current. The offset is checkpointed per update so a kill
@@ -135,7 +147,8 @@ endpoints are public (no token).
 - **Auth:** none. **Demo need:** useful. **Data kind:** metadata.
 - **Question:** "Who administers this registry, and what does it support?"
 - **Important response fields:** admin party, supported APIs/features, version.
-- **Proposed table(s):** `service_health` (or a small `registries` table).
+- **Proposed table(s):** none yet - no registry metadata is persisted. Would
+  need a new `registries` table; `ScannerDB` has no equivalent today.
 - **Future feature:** knowing which registry serves which token.
 - **Privacy / permission:** public network metadata.
 - **Known limitations:** describes one registry; the network has several.
@@ -144,9 +157,10 @@ endpoints are public (no token).
 - **Auth:** none. **Demo need:** useful. **Data kind:** metadata.
 - **Question:** "Which tokens does this registry serve, and with what decimals?"
 - **Important response fields:** instrument id, name, administrator, decimals.
-- **Proposed table(s):** `instruments`.
-- **Proposed fields:** `instrument_id` (PK), `name`, `administrator`,
-  `decimals`, `registry_base`, `raw_json`.
+- **Proposed table(s):** none yet - `ScannerDB` stores only the instrument id
+  on each holding. Would need a new `instruments` table (`instrument` (PK),
+  `name`, `administrator`, `decimals`, `registry_base`, `raw_json`) before
+  amounts of any token but Amulet can be formatted correctly.
 - **Future feature:** correct formatting of any token, not just Amulet; stops
   Scandex assuming every asset is Canton Coin.
 - **Why selected:** decimals and admin are needed to display and to build
@@ -169,8 +183,10 @@ endpoints are public (no token).
 - **Important response fields:** `factoryId`, `transferKind`
   (`direct`/`offer`/`self`), `choiceContext` (`choiceContextData`,
   `disclosedContracts`).
-- **Proposed table(s):** `transfer_offers` (when an offer results), plus
-  `raw_api_responses` for the context.
+- **Proposed table(s):** `transfers` with `transfer_kind='offer'` and
+  `status='pending'` - the same rows the indexer already writes when it sees a
+  `TransferInstruction` created on the ledger. (Preview is read-only and
+  persists nothing today; there is no `raw_api_responses` table.)
 - **Future feature:** the transfer preview screen — tell the user *before* they
   sign whether money moves now (`direct`) or waits for acceptance (`offer`).
 - **Why selected:** it answers the single most confusing question in a Canton
@@ -192,21 +208,88 @@ endpoints are public (no token).
 
 The tables above marked "IMPLEMENTED" are populated by
 [`scandex_api.indexer`](../src/scandex_api/indexer.py), a stdlib-only scanner
-that satisfies challenge A1:
+that satisfies challenge A1. Persistence goes through
+[`ScannerDB`](../src/scandex_api/store.py) — see
+[API_INTEGRATION.md](API_INTEGRATION.md) for the full schema.
 
 1. On first run for a party, `Indexer.run_once` calls `LedgerClient.ledger_end`
-   and then `LedgerClient.holdings(party)` — seeding `holdings` and recording
-   the offset in `ledger_offsets(stream='updates')`.
+   and then `LedgerClient.holdings(party)` — seeding `holdings`, registering the
+   party in `parties`, and recording the offset in the `checkpoint` table.
 2. On every run after that, it reads `ledger_end` again, then
    `LedgerClient.updates(begin_exclusive=saved, end_inclusive=current)` and
-   walks each transaction tree, applying `Holding` created/archived events
-   into `holdings` and appending "credit" / "debit" rows to `transfers`
-   (with `UNIQUE(update_id, sender, receiver, instrument, amount)` making
-   replays idempotent). The offset is saved per applied update.
-3. A restart with a non-null `ledger_offsets` row **never** re-reads the ACS.
+   walks each transaction tree. `Holding` created/archived events go into
+   `holdings` and append `credit` / `debit` rows to `transfers`; a
+   `TransferInstruction` created event appends an `offer` row with
+   `status='pending'`, and its archive flips that row to `resolved`. Replays are
+   idempotent (see the two transfer constraints in API_INTEGRATION.md). The
+   offset is saved per applied update.
+3. A restart with a non-null `checkpoint` row **never** re-reads the ACS.
 
 `--index`, `--balance`, and `--history` on
-[`scripts/check_cantor8.py`](../../scripts/check_cantor8.py) drive it.
+[`scripts/check_cantor8.py`](../scripts/check_cantor8.py) drive it.
+
+---
+
+## Local API — what Scandex *serves*, not what it reads
+
+> **Read this heading carefully — it is the opposite direction from every other
+> section in this file.** Everything above and below catalogues endpoints
+> Scandex **calls on Cantor8** (ledger, registry, scanner, public scan). This
+> section is the small JSON API Scandex **exposes on localhost** to its own
+> frontend, out of the database the indexer filled.
+>
+> The route names deliberately echo Cantor8's own scanner read API
+> (`/health`, `/tokens/balance/{party}`, `/tokens/transfers/{party}`). They are
+> **not the same service**: Cantor8's scanner lives at `C8_SCANNER_BASE`, needs
+> a token, and is not provisioned for hackathon credentials; ours lives at
+> `http://127.0.0.1:8787`, needs no auth, and answers from our own SQLite file.
+> If a balance looks wrong, check which one you called.
+
+Served by [`scandex_api.webapi`](../src/scandex_api/webapi.py) —
+`http.server` only, no Flask/FastAPI, matching the package's zero-runtime-
+dependency rule. Start it with any of:
+
+```bash
+python scripts/serve_api.py --db scandex.db --port 8787
+python scripts/check_cantor8.py --serve --db scandex.db --port 8787
+serve-scandex-api --db scandex.db          # if pip-installed
+```
+
+Read-only: no route writes to the database or to the ledger. Every response
+carries `Access-Control-Allow-Origin: *` because this is a local demo server —
+see the security note in `webapi.py` before reusing that anywhere else.
+
+| Method | Path | Backed by | Feature | Notes |
+|---|---|---|---|---|
+| `GET` | `/health` | `get_health(ledger_end)` | P7 | offsets, counts, staleness, live drift |
+| `GET` | `/parties` | `get_parties()` | P3 | party selector |
+| `GET` | `/tokens/balance/{party}` | `get_balance(party)` | P1, P2 | `?instrument=` filter; `total` vs `spendable` |
+| `GET` | `/tokens/holdings/{party}` | `get_holdings_raw(party)` | P2 | individual "banknotes"; `?active_only=0` includes archived |
+| `GET` | `/tokens/transfers/{party}` | `get_transfers(party)` | P4 | `?limit=` (default 50), newest first |
+| `GET` | `/tokens/transfers/stale` | `get_stale_transfers()` | P8 | `?older_than_seconds=` overrides the threshold |
+| `GET` | `/tokens/owners` | `get_owners()` | bonus | `?instrument=` filter |
+| `GET` | `/metrics` | `get_metrics(ledger_end)` | P9 | per-instrument volume and locked totals |
+| `GET` | `/` | — | — | lists the routes above |
+
+Error contract:
+
+- unknown route → `404` with `{"error": "no such route: ...", "routes": [...]}`
+- party the indexer has never seen → `404` with
+  `{"error": "unknown party: ...", "hint": "..."}`
+- party that is known but holds nothing yet → `200` with an **empty list**, not
+  an error. A new party with no activity is a normal state, not a failure.
+- an unparseable query parameter falls back to its default rather than `500`
+
+`/health` and `/metrics` call `LedgerClient.ledger_end()` on each request behind
+a short timeout, so `ledger_offset` and `scanner_delay_offsets` reflect real
+drift. If the ledger is unreachable — or no `C8_CLIENT_SECRET` is set — both
+fields come back `null` with a `ledger_offset_note` saying why, and every
+locally-computed number in the response stays correct. The API deliberately
+stays up when DevNet is down.
+
+`scanner_delay_offsets` is a difference **in offsets, not seconds**, and is
+`null` whenever either offset is not numeric on this deployment — an opaque
+string offset reports unknown rather than a nonsense subtraction.
 
 ---
 
@@ -226,9 +309,10 @@ authoritative balance/history for our own party comes from the local
 - **Question:** "Is the index up, is its database healthy, and how far behind is
   it?"
 - **Important response fields:** `status`, `db.status`, `db.scannerDelaySecs`.
-- **Proposed table(s):** `service_health`.
-- **Proposed fields:** `service`, `status`, `db_status`, `scanner_delay_secs`,
-  `observed_at`.
+- **Proposed table(s):** none yet - health is computed on demand by
+  `ScannerDB.get_health()` and not stored as a time series. Persisting it would
+  need a new `service_health` table (`service`, `status`, `db_status`,
+  `scanner_delay_secs`, `recorded_at`).
 - **Future feature:** a freshness banner; a rule that anything read from the
   scanner is stored with the delay it was read at.
 - **Why selected:** the scanner is a read model and *will* lag; you must record
@@ -268,7 +352,8 @@ authoritative balance/history for our own party comes from the local
 ### `GET /api/scan/v0/scans`
 - **Auth:** none. **Demo need:** optional. **Data kind:** metadata.
 - **Question:** "Every scan node on the network."
-- **Maps to:** `service_health` / a `scan_nodes` reference table.
+- **Maps to:** nothing persisted today; would need a `scan_nodes` reference
+  table.
 
 ### `GET /api/scan/v0/splice-instance-names`
 - **Auth:** none. **Demo need:** optional. **Data kind:** metadata.
