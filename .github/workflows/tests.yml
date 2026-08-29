@@ -1,0 +1,77 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  secret-scan:
+    # Fails the build if anything resembling a committed secret is found.
+    # Runs first so a leak never reaches the test matrix. No network, no secrets.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan tree for committed secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+
+          echo "1) private key blocks"
+          if grep -rInE --exclude-dir=.git \
+               -e "-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----" . ; then
+            echo "::error::A private key block is committed."
+            fail=1
+          fi
+
+          echo "2) real .env-style secret assignments (placeholders allowed)"
+          # A concrete value assigned to a *_SECRET / *_TOKEN shell variable,
+          # excluding <placeholders> and empty values. .env is gitignored;
+          # .env.example uses <enter-secret-locally>.
+          if grep -rInE --exclude-dir=.git \
+               --include="*.env" --include=".env*" --exclude=".env.example" \
+               -e "^[[:space:]]*(export[[:space:]]+)?[A-Z0-9_]*(SECRET|TOKEN)=[^<[:space:]\"']" . ; then
+            echo "::error::A concrete secret/token value is committed in an env file."
+            fail=1
+          fi
+
+          echo "3) JWTs (excluding the redaction module and the test fixture)"
+          # eyJ... . ... . ... shaped tokens. The only legitimate occurrences are
+          # the redaction regex source and the deliberate non-secret test fixture.
+          if grep -rInE --exclude-dir=.git \
+               --exclude="redaction.py" --exclude="_fakes.py" \
+               -e "eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}" . ; then
+            echo "::error::A JWT-shaped string is committed outside the allowed fixtures."
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "Secret scan FAILED."
+            exit 1
+          fi
+          echo "Secret scan clean."
+
+  test:
+    needs: secret-scan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile all sources
+        run: python -m compileall src scripts tests
+      - name: Install pytest (dev only)
+        run: python -m pip install --upgrade pip pytest
+      - name: Run tests (pytest, offline)
+        run: python -m pytest -q
+      - name: Run tests (unittest fallback, offline)
+        run: python -m unittest discover -s tests
