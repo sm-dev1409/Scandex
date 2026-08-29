@@ -93,6 +93,10 @@ class ScandexHandler(BaseHTTPRequestHandler):
 
     db: ScannerDB = None  # type: ignore[assignment]
     ledger = None
+    # "test" (fabricated demo_data seed) or "real" (indexed ledger data). Bound
+    # by make_server so /health and / can report it and a frontend never has to
+    # guess which dataset it is looking at from the port number.
+    data_mode: str = "real"
     server_version = "scandex-webapi"
     sys_version = ""
     # Set by make_server; default is silence so the test suite does not spray
@@ -203,8 +207,17 @@ class ScandexHandler(BaseHTTPRequestHandler):
 
         if kind == "transfers":
             limit = _int_param(params, "limit", 50)
+            instrument = params.get("instrument", [None])[0]
+            direction = params.get("direction", [None])[0]
+            # Anything that is not one of the two known directions means "both",
+            # so a stray ?direction=foo degrades to the unfiltered list rather
+            # than returning nothing.
+            if direction not in ("sent", "received"):
+                direction = None
             with _DB_LOCK:
-                rows = self.db.get_transfers(party, limit=limit)
+                rows = self.db.get_transfers(party, limit=limit,
+                                             instrument=instrument,
+                                             direction=direction)
                 known = self._party_known(party)
             if not rows and not known:
                 return 404, self._unknown_party(party)
@@ -239,6 +252,10 @@ class ScandexHandler(BaseHTTPRequestHandler):
         offset, note = _ledger_end(self.ledger)
         with _DB_LOCK:
             payload = self.db.get_health(offset)
+        # Which dataset is this? Reported by the server rather than inferred by
+        # the client, so a demo can never silently pass fabricated numbers off
+        # as ledger data. See demo_data.py's honesty note.
+        payload["data_mode"] = self.data_mode
         if note:
             payload["ledger_offset_note"] = note
         return payload
@@ -256,12 +273,14 @@ class ScandexHandler(BaseHTTPRequestHandler):
             "service": "scandex local API",
             "readOnly": True,
             "database": self.db.path,
+            "dataMode": self.data_mode,
             "routes": sorted(_ROUTES),
         }
 
 
 def make_server(db: ScannerDB, host: str = "127.0.0.1", port: int = 8787,
-                ledger=None, logger=None) -> ThreadingHTTPServer:
+                ledger=None, logger=None,
+                data_mode: str = "real") -> ThreadingHTTPServer:
     """Build (but do not start) the server.
 
     Tests use this to bind port 0 and run ``serve_forever`` on a thread; the
@@ -271,19 +290,24 @@ def make_server(db: ScannerDB, host: str = "127.0.0.1", port: int = 8787,
     handler = type("BoundScandexHandler", (ScandexHandler,), {
         "db": db,
         "ledger": ledger,
+        "data_mode": data_mode,
         "log_line": staticmethod(logger or (lambda _msg: None)),
     })
     return ThreadingHTTPServer((host, port), handler)
 
 
 def serve(db: ScannerDB, host: str = "127.0.0.1", port: int = 8787,
-          ledger=None, logger=print) -> None:
+          ledger=None, logger=print, data_mode: str = "real") -> None:
     """Serve the local JSON API until interrupted. Blocks."""
-    httpd = make_server(db, host, port, ledger=ledger, logger=logger)
+    httpd = make_server(db, host, port, ledger=ledger, logger=logger,
+                        data_mode=data_mode)
     bound_host, bound_port = httpd.server_address[:2]
     if logger:
         logger(f"Scandex local API on http://{bound_host}:{bound_port}  "
-               f"(db={db.path}, read-only)")
+               f"(db={db.path}, read-only, data-mode={data_mode})")
+        if data_mode == "test":
+            logger("DATA MODE: TEST - every figure served is fabricated demo "
+                   "data, not ledger data. No ledger connection is used.")
         for route in _ROUTES:
             logger(f"  GET {route}")
         logger("CORS is wide open (demo server). Ctrl-C to stop.")
@@ -308,8 +332,15 @@ def build_parser() -> argparse.ArgumentParser:
         prog="serve_api.py",
         description="Serve the indexed Scandex database as a local JSON API.",
     )
-    parser.add_argument("--db", default="scandex.db", metavar="PATH",
-                        help="SQLite database the indexer writes (default: scandex.db).")
+    parser.add_argument("--db", default=None, metavar="PATH",
+                        help="SQLite database to serve. Defaults to scandex.db "
+                             "in real mode and scandex-test.db in test mode.")
+    parser.add_argument("--data-mode", choices=("real", "test"), default="real",
+                        help="'real' (default) serves whatever the indexer has "
+                             "written to --db. 'test' seeds and serves a "
+                             "deterministic fabricated dataset and never "
+                             "contacts the ledger - use it to demo the whole "
+                             "stack with no C8_CLIENT_SECRET and no network.")
     parser.add_argument("--host", default="127.0.0.1",
                         help="Bind address (default: 127.0.0.1).")
     parser.add_argument("--port", type=int, default=8787,
@@ -351,14 +382,36 @@ def build_ledger_client(no_ledger: bool = False):
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    try:
-        ledger = build_ledger_client(args.no_ledger)
-    except ConfigError as exc:
-        print(f"CONFIGURATION ERROR: {exc}", file=sys.stderr)
-        return 2
-    with ScannerDB(args.db, stale_seconds=args.stale_seconds) as db:
+    test_mode = args.data_mode == "test"
+
+    # Separate files per mode so seeding the demo dataset can never overwrite a
+    # real indexed database, and so switching modes needs no --db flag.
+    db_path = args.db or ("scandex-test.db" if test_mode else "scandex.db")
+
+    if test_mode:
+        # No ledger client at all in test mode: not "a client we happen not to
+        # use", but never constructed - so no code path here can reach the
+        # network. That is what makes "test mode is offline" actually checkable.
+        ledger = None
+    else:
         try:
-            serve(db, host=args.host, port=args.port, ledger=ledger)
+            ledger = build_ledger_client(args.no_ledger)
+        except ConfigError as exc:
+            print(f"CONFIGURATION ERROR: {exc}", file=sys.stderr)
+            return 2
+
+    with ScannerDB(db_path, stale_seconds=args.stale_seconds) as db:
+        if test_mode:
+            from .demo_data import seed_demo_data
+            summary = seed_demo_data(db)
+            print(f"Seeded demo data into {db_path}: "
+                  f"{len(summary['parties'])} parties, "
+                  f"{summary['holdings']} holdings, "
+                  f"{summary['transfers']} transfers "
+                  f"({summary['stale_pending']} stale pending).")
+        try:
+            serve(db, host=args.host, port=args.port, ledger=ledger,
+                  data_mode=args.data_mode)
         except KeyboardInterrupt:
             print("\nStopped.")
     return 0

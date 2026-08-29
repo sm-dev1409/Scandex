@@ -524,20 +524,49 @@ Idempotent: replaying the same update never double-counts. Two
         rows = self.conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
 
-    def get_transfers(self, party_id: str, limit: int = 50) -> list:
-        """Transfer history for a party (sent or received), newest first."""
-        rows = self.conn.execute(
-            """
+    def get_transfers(
+        self,
+        party_id: str,
+        limit: int = 50,
+        instrument: Optional[str] = None,
+        direction: Optional[str] = None,
+    ) -> list:
+        """Transfer history for a party (sent or received), newest first.
+
+        Args:
+            limit: maximum rows to return.
+            instrument: restrict to one instrument (``None`` = all).
+            direction: ``'sent'`` (party is the sender), ``'received'`` (party
+                is the receiver), or ``None``/anything else for both.
+
+        The filters are applied in SQL, *before* ``LIMIT``, on purpose. Filtering
+        a already-limited list client-side would silently return fewer than
+        ``limit`` matching rows - "the newest 50 transfers, of which 3 are
+        c8BTC" is not the same answer as "the newest 50 c8BTC transfers".
+        """
+        query = """
             SELECT id, update_id, contract_id, sender, receiver, amount,
                    instrument, transfer_kind, status, source,
                    scanner_delay_secs, ledger_offset, recorded_at
             FROM transfers
-            WHERE sender = ? OR receiver = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (party_id, party_id, limit),
-        ).fetchall()
+        """
+        if direction == "sent":
+            query += " WHERE sender = ?"
+            params = [party_id]
+        elif direction == "received":
+            query += " WHERE receiver = ?"
+            params = [party_id]
+        else:
+            query += " WHERE (sender = ? OR receiver = ?)"
+            params = [party_id, party_id]
+
+        if instrument:
+            query += " AND instrument = ?"
+            params.append(instrument)
+
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
 
     def get_transfer_detail(self, update_id: str) -> list:
