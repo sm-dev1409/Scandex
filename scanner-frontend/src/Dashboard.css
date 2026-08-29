@@ -40,8 +40,8 @@
   display: grid;
   place-items: center;
   border-radius: 9px;
-  background: linear-gradient(150deg, var(--accent) 0%, #6d28d9 100%);
-  box-shadow: 0 0 0 1px var(--accent-line), 0 6px 18px rgba(139, 92, 246, 0.35);
+  background: linear-gradient(150deg, var(--accent) 0%, #0a47b5 100%);
+  box-shadow: 0 0 0 1px var(--accent-line), 0 6px 18px rgba(47, 96, 207, 0.35);
   color: #fff;
   font-size: 15px;
   font-weight: 700;
@@ -118,18 +118,18 @@
   border-color: var(--line-strong);
   box-shadow:
     0 0 0 1px var(--accent-line),
-    0 24px 60px -28px rgba(139, 92, 246, 0.6);
+    0 24px 60px -28px rgba(47, 96, 207, 0.6);
 }
 
-/* Soft radial violet glow, purely decorative. */
+/* Soft radial blue glow, purely decorative. */
 .hero::before {
   content: '';
   position: absolute;
   inset: -60% 20% 30% -20%;
   background: radial-gradient(
     50% 50% at 30% 60%,
-    rgba(139, 92, 246, 0.4) 0%,
-    rgba(139, 92, 246, 0.12) 45%,
+    rgba(47, 96, 207, 0.4) 0%,
+    rgba(47, 96, 207, 0.12) 45%,
     transparent 72%
   );
   pointer-events: none;
@@ -225,14 +225,14 @@
   letter-spacing: -0.01em;
   color: #fff;
   background: linear-gradient(180deg, var(--accent-hi) 0%, var(--accent) 100%);
-  box-shadow: 0 8px 24px -8px rgba(139, 92, 246, 0.9);
+  box-shadow: 0 8px 24px -8px rgba(47, 96, 207, 0.9);
   cursor: pointer;
   transition: transform 120ms ease, box-shadow 200ms ease, filter 200ms ease;
 }
 
 .btn-primary:hover {
   filter: brightness(1.08);
-  box-shadow: 0 12px 30px -8px rgba(139, 92, 246, 1);
+  box-shadow: 0 12px 30px -8px rgba(47, 96, 207, 1);
 }
 
 .btn-primary:active {

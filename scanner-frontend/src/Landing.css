@@ -22,7 +22,7 @@
   height: 1100px;
   transform: translateX(-50%);
   border-radius: 50%;
-  background: radial-gradient(circle, rgba(139, 92, 246, 0.2), transparent 60%);
+  background: radial-gradient(circle, rgba(47, 96, 207, 0.2), transparent 60%);
   pointer-events: none;
 }
 
@@ -44,7 +44,7 @@
   display: grid;
   place-items: center;
   border-radius: 9px;
-  background: linear-gradient(150deg, #a78bfa, #6d38e0);
+  background: linear-gradient(150deg, #2f60cf, #0a47b5);
   color: #fff;
   font-size: 14px;
   font-weight: 800;
@@ -62,11 +62,27 @@
 .landing-hero {
   position: relative;
   z-index: 1;
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: 55fr 45fr;
   align-items: center;
+  gap: 48px;
   padding: 132px 48px 0;
-  text-align: center;
+  text-align: left;
+}
+
+/* The scene is a self-contained document carrying its own dark gradient, so it
+   floats straight over the page — no card, border, padding or background here.
+   The iframe inside is sized 100%/100%, so this box is what holds the previous
+   pass's 520px square, centred in its column and clear of the column edges. */
+.landing-scene {
+  min-width: 0;
+  width: 100%;
+  max-width: 520px;
+  height: 520px;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .status-pill {
@@ -75,9 +91,9 @@
   gap: 9px;
   padding: 6px 13px 6px 10px;
   margin-bottom: 30px;
-  border: 1px solid rgba(167, 139, 250, 0.3);
+  border: 1px solid rgba(47, 96, 207, 0.3);
   border-radius: 999px;
-  color: #c4b5fd;
+  color: #7ea3e8;
   font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 10.5px;
   font-weight: 600;
@@ -91,8 +107,8 @@
   height: 6px;
   flex: none;
   border-radius: 50%;
-  background: #a78bfa;
-  box-shadow: 0 0 10px #a78bfa;
+  background: #2f60cf;
+  box-shadow: 0 0 10px #2f60cf;
 }
 
 .landing-title {
@@ -111,12 +127,12 @@
   font-style: italic;
   font-synthesis: style;
   font-weight: 400;
-  color: #c4b5fd;
+  color: #7ea3e8;
 }
 
 .landing-body {
   max-width: 540px;
-  margin: 0 auto 40px;
+  margin: 0 0 40px;
   color: rgba(255, 255, 255, 0.55);
   font-size: 17px;
   line-height: 1.65;
@@ -128,7 +144,7 @@
 .landing-actions {
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   gap: 16px;
 }
 
@@ -149,11 +165,11 @@
 .btn-solid {
   padding: 17px 30px;
   border: 0;
-  background: #a78bfa;
-  color: #12081f;
+  background: #2f60cf;
+  color: #fff;
   font-size: 16px;
   font-weight: 800;
-  box-shadow: 0 16px 40px rgba(124, 58, 237, 0.35);
+  box-shadow: 0 16px 40px rgba(18, 63, 158, 0.35);
 }
 
 .btn-solid:hover {
@@ -180,7 +196,7 @@
 
 .btn-solid:focus-visible,
 .btn-ghost:focus-visible {
-  outline: 2px solid #a78bfa;
+  outline: 2px solid #2f60cf;
   outline-offset: 3px;
 }
 
@@ -192,6 +208,18 @@
 @media (max-width: 980px) {
   .landing-hero { padding-top: 96px; }
   .landing-title { font-size: 72px; }
+}
+
+/* Below this the two columns are each too narrow to carry their content, so the
+   hero folds back to the original single centred column with the scene under
+   the copy. */
+@media (max-width: 900px) {
+  .landing-hero {
+    grid-template-columns: 1fr;
+    text-align: center;
+  }
+  .landing-body { margin: 0 auto 40px; }
+  .landing-actions { justify-content: center; }
 }
 
 @media (max-width: 700px) {
