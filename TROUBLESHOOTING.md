@@ -103,6 +103,27 @@ You streamed updates from the current ledger end. That gives you the future, not
 the past. Query the **active contract set** first for the balance, then stream
 forward from that same offset to stay current.
 
+### 401 on `scanner-ledger-read-api` (`/tokens/balance/{party}` etc.)
+
+Expected, not a bug. The scanner-ledger-read-api is Cantor8's own reference
+implementation of A1 ("Build a scanner") — the thing participants are
+rebuilding — and hackathon credentials are not provisioned to call its data
+endpoints. `/health` is open and passes; the data endpoints will return 401
+for a participant token and always will.
+
+Do not chase this. The authoritative balance and history for your own party
+come from the Ledger API directly:
+
+```bash
+python scripts/check_cantor8.py --index   --party <your-party>   # seed + catch up
+python scripts/check_cantor8.py --balance --party <your-party>
+python scripts/check_cantor8.py --history --party <your-party>
+```
+
+The diagnostic still probes `/tokens/balance/{party}` so a 401 is surfaced,
+labelled, and understood — it just is not the same class of failure as a 401
+on the Ledger API.
+
 ## Transfers
 
 ### The transfer succeeded but the receiver has no money

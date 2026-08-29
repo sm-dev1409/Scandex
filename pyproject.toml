@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scandex-api"
+version = "0.1.0"
+description = "Scandex Cantor8 (Canton Network) API integration and read-only diagnostics."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+# Runtime uses the Python standard library only. No runtime dependencies.
+dependencies = []
+
+[project.optional-dependencies]
+# Dev-only. The test suite also runs under `python -m unittest discover -s tests`
+# with no third-party packages installed at all.
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+check-cantor8 = "scandex_api.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Tests import a shared helper module (_fakes) by adding src/ to sys.path
+# themselves, so no install is required to run them.
+addopts = "-q"
