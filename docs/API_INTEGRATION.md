@@ -18,7 +18,9 @@ src/scandex_api/
   scanner.py      scanner read API + public Scan API
   models.py       dataclasses: Party, Holding, Instrument, CheckResult, ...
   diagnostics.py  orchestrates checks, formats results, writes reports
-  cli.py          argument parsing + human/JSON output
+  db.py           sqlite3 wrapper: schema, offsets, holdings, transfers
+  indexer.py      A1 scanner: seed the ACS, poll /v2/updates/trees forward
+  cli.py          argument parsing + human/JSON output (diagnostic + scanner)
 ```
 
 Authentication, HTTP transport, per-service logic and report formatting are kept
@@ -45,12 +47,16 @@ The package is standalone. It does **not** import the root `c8lab.py`, and
   is a deliberate decision with privacy consequences — decide per party what is
   exposed.
 
-## Recommended schema
+## Schema
 
-SQLite is fine for the demo (the A1 challenge suggests it). Types below are
-SQLite-flavoured; use the obvious equivalents on Postgres.
+SQLite is fine for the demo (the A1 challenge suggests it) and is what
+[`db.py`](../src/scandex_api/db.py) creates. Types below are SQLite-flavoured;
+use the obvious equivalents on Postgres. Tables the A1 scanner actively writes
+today are marked **[implemented]**; others are left as targets for the next
+extension (e.g. adding an instruments cache once the registry is wired into
+the indexer).
 
-### `parties`
+### `parties`  **[implemented]**
 | column | type | notes |
 |---|---|---|
 | `party_id` | TEXT PRIMARY KEY | full `hint::fingerprint` id |
@@ -72,7 +78,7 @@ Index: `(is_local)`.
 | `registry_base` | TEXT | which registry served it |
 | `raw_json` | TEXT | verbatim metadata payload |
 
-### `holdings`  (current state; a UTXO set, not a number)
+### `holdings`  (current state; a UTXO set, not a number)  **[implemented]**
 | column | type | notes |
 |---|---|---|
 | `contract_id` | TEXT PRIMARY KEY | the holding contract |
@@ -97,7 +103,7 @@ Indexes: `(party_id, instrument_id)`, `(locked)`. Spendable = unlocked rows.
 | `archived_at_offset` | TEXT NULL | null while active |
 | `payload_json` | TEXT | verbatim |
 
-### `transfers`  (history)
+### `transfers`  (history)  **[implemented]**
 | column | type | notes |
 |---|---|---|
 | `id` | INTEGER PRIMARY KEY AUTOINCREMENT | |
@@ -126,7 +132,7 @@ Indexes: `(sender)`, `(receiver)`, `(update_id)`.
 | `created_at_offset` | TEXT | |
 | `observed_at` | TEXT | |
 
-### `ledger_offsets`  (resume points)
+### `ledger_offsets`  (resume points)  **[implemented]**
 | column | type | notes |
 |---|---|---|
 | `id` | INTEGER PRIMARY KEY | usually a single row per stream |
@@ -137,7 +143,7 @@ Indexes: `(sender)`, `(receiver)`, `(update_id)`.
 The A1 scanner saves its offset here and resumes from it after a restart instead
 of re-reading everything.
 
-### `service_health`  (operational health, time series)
+### `service_health`  (operational health, time series)  **[implemented]** (empty schema; the diagnostic writes ad-hoc, no rows persisted yet)
 | column | type | notes |
 |---|---|---|
 | `id` | INTEGER PRIMARY KEY AUTOINCREMENT | |

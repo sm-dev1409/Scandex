@@ -93,18 +93,29 @@ truth.
 - **Known limitations:** the diagnostic must never run this. It is surfaced as
   `EXPECTED MANUAL ACTION`.
 
-### `WS /v2/updates`  — DOCUMENTED, NOT EXERCISED
-- **Auth:** token. **Demo need:** useful (future). **Data kind:** history/state.
-- **Question:** "Stream every created/archived contract from an offset onward."
-- **Important response fields:** created/archived events, offsets.
-- **Proposed table(s):** `contracts`, `ledger_offsets`, `transfers`.
-- **Future feature:** live balances and event-driven indexing (A1's stream
-  layer): read the ACS first for the present, then stream forward from that
-  same offset to stay current.
-- **Why catalogued:** it is the natural next step for a live index; the stdlib
-  client does not open a WebSocket.
-- **Known limitations:** not tested by this toolkit; streaming from the current
-  end gives you the future, not the past — seed from the ACS first.
+### `POST /v2/updates/trees`  — IMPLEMENTED (A1 scanner)
+- **Auth:** token. **Demo need:** useful. **Data kind:** history/state.
+- **Question:** "Give me every transaction tree in `(beginExclusive, endInclusive]`."
+- **Important response fields:** per update, `TransactionTree.updateId`,
+  `TransactionTree.offset`, `TransactionTree.eventsById` (a map of node-id →
+  `CreatedTreeEvent` / `ExercisedTreeEvent`).
+- **Tables written:** `ledger_offsets`, `holdings`, `transfers`.
+- **Feature backed:** [A1 scanner](#a1-scanner-implementation) — reads the ACS
+  first for the present, then polls this endpoint forward from that same
+  offset to stay current. The offset is checkpointed per update so a kill
+  and restart resumes cleanly with no gap and no re-seed.
+- **Why POST-batch, not WebSocket:** the v2 API exposes `/v2/updates/trees`
+  both as a WebSocket stream (open-ended) and as an HTTP POST batch when
+  `endInclusive` is set. The batch shape is exactly what a polling indexer
+  wants and keeps the toolkit standard-library-only. See
+  `LedgerClient.updates` in [`ledger.py`](../src/scandex_api/ledger.py) for
+  the wire body and the tradeoff.
+- **Known traps (all A1's):**
+  - Transactions are trees, not flat lists — walk `eventsById`.
+  - `Holding` is an interface; use the `InterfaceFilter` here too or created
+    Holdings arrive with no view.
+  - Streaming from the current end only gives you the future; seed from the
+    ACS first.
 
 ### Setup / mutation endpoints — MANUAL ONLY
 - `POST /v2/parties` (allocate a party) and
@@ -177,7 +188,38 @@ endpoints are public (no token).
 
 ---
 
-## Scanner read API — `C8_SCANNER_BASE`  (indexed read model, can lag)
+## A1 scanner implementation
+
+The tables above marked "IMPLEMENTED" are populated by
+[`scandex_api.indexer`](../src/scandex_api/indexer.py), a stdlib-only scanner
+that satisfies challenge A1:
+
+1. On first run for a party, `Indexer.run_once` calls `LedgerClient.ledger_end`
+   and then `LedgerClient.holdings(party)` — seeding `holdings` and recording
+   the offset in `ledger_offsets(stream='updates')`.
+2. On every run after that, it reads `ledger_end` again, then
+   `LedgerClient.updates(begin_exclusive=saved, end_inclusive=current)` and
+   walks each transaction tree, applying `Holding` created/archived events
+   into `holdings` and appending "credit" / "debit" rows to `transfers`
+   (with `UNIQUE(update_id, sender, receiver, instrument, amount)` making
+   replays idempotent). The offset is saved per applied update.
+3. A restart with a non-null `ledger_offsets` row **never** re-reads the ACS.
+
+`--index`, `--balance`, and `--history` on
+[`scripts/check_cantor8.py`](../../scripts/check_cantor8.py) drive it.
+
+---
+
+## Scanner read API — `C8_SCANNER_BASE`  (reference-only for A1)
+
+The Cantor8 scanner-ledger-read-api is Cantor8's own reference implementation
+of challenge A1 ("Build a scanner"). Hackathon credentials are not provisioned
+against it — data endpoints return `401` for the participant token, and that
+is expected, not a bug. `scanner.py` still hits `/health` (open) and probes
+`/tokens/balance/{party}` as a best-effort call that degrades gracefully; the
+authoritative balance/history for our own party comes from the local
+`scandex_api.indexer` reading the Ledger API directly.
+
 
 ### `GET /health`
 - **Auth:** none. **Demo need:** useful. **Data kind:** health.
@@ -246,7 +288,9 @@ endpoints are public (no token).
 
 - `POST /v2/commands/submit-and-wait` — write path. Never executed by the
   diagnostic.
-- `WS /v2/updates` — streaming. Documented, not exercised by the stdlib client.
+- `WS /v2/updates` — the WebSocket variant is not opened by the stdlib client;
+  the A1 scanner uses `POST /v2/updates/trees` as a bounded batch instead
+  (same events, no WS dependency). See the `POST /v2/updates/trees` entry.
 - `POST /v2/parties`, `POST /v2/users/{userId}/rights`,
   registry `transfer-factory` **exercise**, and the accept/reject/withdraw
   choice contexts — all mutating; surfaced as `EXPECTED MANUAL ACTION`.

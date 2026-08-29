@@ -16,6 +16,13 @@ Runs from a bare clone with no `pip install`:
     python scripts/check_cantor8.py --preview-transfer <from> <to> <amount> [--instrument Amulet]
     python scripts/check_cantor8.py --timeout 20
 
+A1 scanner subcommands (read-only, back the whole thing with a local SQLite):
+
+    python scripts/check_cantor8.py --index --party <party-id>
+    python scripts/check_cantor8.py --index --follow --tick 5
+    python scripts/check_cantor8.py --balance --party <party-id>
+    python scripts/check_cantor8.py --history --party <party-id> --limit 25
+
 All logic lives in the importable package (scandex_api.cli); this file only
 puts src/ on sys.path when the package is not installed, then delegates.
 """

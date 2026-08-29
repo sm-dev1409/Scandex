@@ -109,6 +109,45 @@ class LedgerClient:
         # The API returns a JSON array of entries.
         return data if isinstance(data, list) else data.get("result", [])
 
+    def updates(
+        self,
+        begin_exclusive,
+        end_inclusive,
+        parties: list[str],
+        filters: list | None = None,
+    ) -> list:
+        """Batch fetch transaction trees in ``(begin_exclusive, end_inclusive]``.
+
+        The A1 scanner uses this to catch up from a saved offset to the current
+        ledger end without a WebSocket dependency. The v2 streaming endpoints
+        (``/v2/updates/flats``, ``/v2/updates/trees``) are also exposed as HTTP
+        POST batch queries when ``endInclusive`` is set - which is exactly the
+        polling shape we want for a stdlib-only indexer.
+
+        ``filters`` defaults to the same ``Holding`` interface filter used by
+        :meth:`holdings`, so a Holding created or archived anywhere in the tree
+        shows up with its interface view populated.
+        """
+        cumulative = filters if filters is not None else [{
+            "identifierFilter": {"InterfaceFilter": {"value": {
+                "interfaceId": HOLDING_INTERFACE,
+                "includeInterfaceView": True,
+                "includeCreatedEventBlob": False,
+            }}}
+        }]
+        body = {
+            "beginExclusive": begin_exclusive,
+            "endInclusive": end_inclusive,
+            "verbose": False,
+            "filter": {"filtersByParty": {p: {"cumulative": cumulative} for p in parties}},
+        }
+        resp = self._raise_for_status(
+            self._post("/v2/updates/trees", body), "updates-trees")
+        data = resp.json()
+        if isinstance(data, list):
+            return data
+        return data.get("updates") or data.get("result") or []
+
     def holdings(self, party: str, offset: str | None = None) -> HoldingsSummary:
         """A consistent snapshot of a party's Holding contracts.
 
