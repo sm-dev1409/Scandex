@@ -287,6 +287,12 @@ def serve(db: ScannerDB, host: str = "127.0.0.1", port: int = 8787,
         for route in _ROUTES:
             logger(f"  GET {route}")
         logger("CORS is wide open (demo server). Ctrl-C to stop.")
+        # serve_forever() blocks with no further output, so an unflushed banner
+        # would leave a redirected log empty and the server looking dead.
+        try:
+            sys.stdout.flush()
+        except Exception:  # pragma: no cover - a closed/odd stream is not fatal
+            pass
     try:
         httpd.serve_forever()
     finally:
