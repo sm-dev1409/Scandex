@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings: a CRLF shebang line makes Linux/macOS
+# fail with "bad interpreter: /usr/bin/env bash^M". scripts/check_all.sh is
+# checked out on Windows but also runs in CI on ubuntu-latest.
+*.sh text eol=lf
