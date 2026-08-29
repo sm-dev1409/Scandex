@@ -251,9 +251,16 @@ dependency rule. Start it with any of:
 
 ```bash
 python scripts/serve_api.py --db scandex.db --port 8787
+python scripts/serve_api.py --data-mode test          # fabricated demo data, offline
 python scripts/check_cantor8.py --serve --db scandex.db --port 8787
 serve-scandex-api --db scandex.db          # if pip-installed
 ```
+
+`--data-mode` selects the dataset: `real` (default) serves whatever the indexer
+wrote to `--db` (default `scandex.db`); `test` seeds and serves a deterministic
+fabricated dataset from [`demo_data.py`](../src/scandex_api/demo_data.py)
+(default `scandex-test.db`) and never constructs a ledger client at all. The
+mode is reported back on `/health` and `/` — see `data_mode` below.
 
 Read-only: no route writes to the database or to the ledger. Every response
 carries `Access-Control-Allow-Origin: *` because this is a local demo server —
@@ -261,15 +268,48 @@ see the security note in `webapi.py` before reusing that anywhere else.
 
 | Method | Path | Backed by | Feature | Notes |
 |---|---|---|---|---|
-| `GET` | `/health` | `get_health(ledger_end)` | P7 | offsets, counts, staleness, live drift |
+| `GET` | `/health` | `get_health(ledger_end)` | P7 | offsets, counts, staleness, live drift, `data_mode` |
 | `GET` | `/parties` | `get_parties()` | P3 | party selector |
 | `GET` | `/tokens/balance/{party}` | `get_balance(party)` | P1, P2 | `?instrument=` filter; `total` vs `spendable` |
 | `GET` | `/tokens/holdings/{party}` | `get_holdings_raw(party)` | P2 | individual "banknotes"; `?active_only=0` includes archived |
-| `GET` | `/tokens/transfers/{party}` | `get_transfers(party)` | P4 | `?limit=` (default 50), newest first |
+| `GET` | `/tokens/transfers/{party}` | `get_transfers(party)` | P4 | `?limit=` (default 50), `?instrument=`, `?direction=sent\|received`; newest first |
 | `GET` | `/tokens/transfers/stale` | `get_stale_transfers()` | P8 | `?older_than_seconds=` overrides the threshold |
 | `GET` | `/tokens/owners` | `get_owners()` | bonus | `?instrument=` filter |
 | `GET` | `/metrics` | `get_metrics(ledger_end)` | P9 | per-instrument volume and locked totals |
-| `GET` | `/` | — | — | lists the routes above |
+| `GET` | `/` | — | — | lists the routes above, plus `dataMode` |
+
+### Response envelopes — what the frontend unwraps
+
+Every **list** route wraps its payload in an object rather than returning a
+bare array, because the wrapper carries metadata the frontend uses:
+
+| Route | Envelope | The list is under |
+|---|---|---|
+| `/parties` | `{"parties": [...]}` | `.parties` |
+| `/tokens/balance/{party}` | `{"party": ..., "byInstrument": [...]}` | `.byInstrument` |
+| `/tokens/holdings/{party}` | `{"party": ..., "activeOnly": ..., "holdings": [...]}` | `.holdings` |
+| `/tokens/transfers/{party}` | `{"party": ..., "count": ..., "transfers": [...]}` | `.transfers` |
+| `/tokens/transfers/stale` | `{"olderThanSeconds": ..., "count": ..., "transfers": [...]}` | `.transfers` |
+| `/tokens/owners` | `{"owners": [...]}` | `.owners` |
+
+`/health` and `/metrics` are the exception: they return their fields **flat**,
+with no envelope, and are read as-is.
+
+> This distinction is load-bearing. The dashboard originally tested
+> `Array.isArray(wholeResponse)`, which is `false` for every envelope above, so
+> it rendered "No parties" / "No holdings" / "No transfers" forever against a
+> healthy backend returning HTTP 200. Unwrapping now lives in one place,
+> [`scanner-frontend/src/api.js`](../scanner-frontend/src/api.js), and the
+> shapes are pinned by `tests/test_webapi_contract.py`. **If you flatten a route
+> to a bare array, change all three: the route, `api.js`, and this table.**
+
+### `data_mode`
+
+`/health` carries `data_mode` and `/` carries `dataMode`, each `"test"` or
+`"real"`. It is reported by the server so a client never has to infer which
+dataset it is looking at from the port number. `"test"` means every figure in
+the response is fabricated demo data, not ledger data; the frontend surfaces it
+as a `Data mode: TEST` chip and a banner on `/status`.
 
 Error contract:
 

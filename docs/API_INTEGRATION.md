@@ -74,6 +74,34 @@ SQLite, standard library only. WAL mode is enabled on open — the indexer write
 continuously while the HTTP API reads concurrently, and WAL is what keeps that
 from throwing "database is locked".
 
+### Read methods the local API is built on
+
+These are the methods [`webapi.py`](../src/scandex_api/webapi.py) exposes as
+HTTP routes. Signatures matter to the frontend, so they are listed here rather
+than left to be rediscovered from the source:
+
+```python
+db.get_balance(party_id, instrument=None)
+db.get_holdings_raw(party_id, active_only=True)
+db.get_transfers(party_id, limit=50, instrument=None, direction=None)
+db.get_stale_transfers(older_than_seconds=None)
+db.get_owners(instrument=None)
+db.get_parties()
+db.get_health(current_ledger_offset=None)
+db.get_metrics(current_ledger_offset=None)
+db.get_offset()
+```
+
+`get_transfers`' `instrument` and `direction` (`'sent'` / `'received'` /
+`None`) arguments filter **in SQL, before `LIMIT`**. That ordering is the
+point: filtering an already-limited page in the client would answer "the newest
+50 transfers, of which 3 are c8BTC" when the question was "the newest 50 c8BTC
+transfers". The dashboard's instrument and direction controls map straight onto
+these.
+
+For the JSON envelopes these become on the wire, see
+[ENDPOINT_DATA_MAP.md § Response envelopes](ENDPOINT_DATA_MAP.md#response-envelopes--what-the-frontend-unwraps).
+
 ### `checkpoint` — the restart bookmark
 
 Exactly one row (`CHECK (id = 1)`).

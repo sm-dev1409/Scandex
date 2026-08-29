@@ -124,6 +124,109 @@ The diagnostic still probes `/tokens/balance/{party}` so a 401 is surfaced,
 labelled, and understood — it just is not the same class of failure as a 401
 on the Ledger API.
 
+## Frontend
+
+### The dashboard is empty: "No parties", "No holdings", "No transfers"
+
+The backend is probably fine — both causes below return **HTTP 200** the whole
+time, which is what makes this confusing. Work through it in this order.
+
+**1. Is the frontend calling the right port?**
+
+The API defaults to **8787** (`webapi.py`'s `build_parser()`), and there is no
+dev proxy in `vite.config.js`. If the frontend points anywhere else, every
+request fails in the browser while `curl` against the real port looks perfect.
+
+```bash
+curl -s http://127.0.0.1:8787/health          # is anything listening?
+```
+
+The base URL is `VITE_API_BASE` (see `scanner-frontend/.env.example`),
+defaulting to `http://127.0.0.1:8787`. Check the Network tab: if requests are
+going to a different host or port, or are not being made at all, that is your
+answer. Note `127.0.0.1` rather than `localhost` — the server binds `127.0.0.1`,
+and on some systems `localhost` resolves to `::1` first, where nothing is
+listening.
+
+Remember Vite inlines `import.meta.env` at **build time**: restart `npm run dev`
+after editing `.env.local`.
+
+**2. Is the frontend unwrapping the response envelope?**
+
+Every list route wraps its payload in an object; none of them return a bare
+array:
+
+```bash
+curl -s http://127.0.0.1:8787/parties
+# {"parties": [ ... ]}     <- an object, NOT [ ... ]
+```
+
+So `Array.isArray(response)` is `false` for `/parties`,
+`/tokens/balance/{party}`, `/tokens/transfers/{party}`, `/tokens/holdings/{party}`
+and `/tokens/transfers/stale`. Code that tests the whole response body for
+array-ness silently renders an empty list forever. Read the list out of the
+documented key instead — `.parties`, `.byInstrument`, `.transfers`, `.holdings`
+— which is what `scanner-frontend/src/api.js` does in one place for all of them.
+
+`/health` and `/metrics` are the exception: they are flat and are read as-is.
+
+The full envelope table is in
+[docs/ENDPOINT_DATA_MAP.md](docs/ENDPOINT_DATA_MAP.md#response-envelopes--what-the-frontend-unwraps),
+and `tests/test_webapi_contract.py` pins every shape so a change to one fails
+loudly rather than emptying the UI.
+
+**3. Is there actually any data?**
+
+An empty database renders exactly like a broken connection. Check:
+
+```bash
+curl -s http://127.0.0.1:8787/health     # "status": "no_data" means nothing is indexed
+```
+
+If it says `no_data`, the indexer has not run (or has not reached a checkpoint).
+To rule the frontend out entirely, start the API in test mode — it seeds a known
+dataset and needs no ledger, no secret and no network:
+
+```bash
+python scripts/serve_api.py --data-mode test --port 8787
+```
+
+If the dashboard fills up in test mode, the frontend is fine and the problem is
+upstream in the indexer or its credentials.
+
+### Am I looking at real data or demo data?
+
+Check the **`Data mode`** chip in the dashboard topbar, or the banner on
+`/status`. It reads `data_mode` from `GET /health`, reported by the server:
+
+```bash
+curl -s http://127.0.0.1:8787/health | grep data_mode
+```
+
+`TEST` means every figure on screen is fabricated by `demo_data.py` — not
+ledger data. `REAL` means it came from whatever the indexer wrote to
+`scandex.db`.
+
+### CORS errors in the browser console
+
+The server sends `Access-Control-Allow-Origin: *` on every response, so a CORS
+error usually means the request never reached it — see "is the frontend calling
+the right port?" above. A failed connection and a CORS rejection look similar in
+the console.
+
+### The instrument or direction filter seems to do nothing
+
+Those are real server-side query parameters
+(`?instrument=`, `?direction=sent|received`) applied in SQL before `LIMIT`.
+Confirm the server honours them:
+
+```bash
+curl -s "http://127.0.0.1:8787/tokens/transfers/<party>?direction=sent"
+```
+
+If the count matches the unfiltered request, you are running a build of the API
+from before the filters were wired up — the route used to read only `?limit`.
+
 ## Transfers
 
 ### The transfer succeeded but the receiver has no money

@@ -355,6 +355,215 @@ for.
 `Access-Control-Allow-Origin: *` on every response so any localhost origin can
 call it. Keep it bound to `127.0.0.1`.
 
+## Running the full stack
+
+The sections above cover the diagnostic and the API on their own. This is how
+to run **the whole application** — scanner, database, API and dashboard.
+
+### Test mode — two terminals, no ledger, no secret, no network
+
+The fastest way to see everything working. Nothing here contacts Cantor8, so it
+needs no `C8_CLIENT_SECRET` and no DevNet access. There is **no indexer** in
+this mode — the demo dataset is seeded directly.
+
+```bash
+# terminal 1 — the API, serving fabricated demo data
+python scripts/serve_api.py --data-mode test --port 8787
+
+# terminal 2 — the dashboard
+cd scanner-frontend
+npm install          # first time only
+npm run dev
+```
+
+Open the URL Vite prints (http://localhost:5173 by default), then go to
+**/dashboard**. You should see three parties (Alice, Bob, Carol), Alice's
+balance of **100 Amulet total / 80 spendable / 1 locked** plus 2 c8BTC, five
+transfer rows one of which is badged **stale pending**, and a
+**`Data mode: TEST`** chip in the topbar. **/status** shows scanner health and
+metrics.
+
+### Real mode — three terminals
+
+Serves data the indexer actually read from the Cantor8 ledger. Requires
+`C8_CLIENT_SECRET` (see [Quick start](#quick-start)).
+
+```bash
+# terminal 1 — the scanner: the only writer
+python scripts/check_cantor8.py --index --follow --party <your-party-id>
+
+# terminal 2 — the API: read-only, same file
+python scripts/serve_api.py --data-mode real --port 8787
+
+# terminal 3 — the dashboard
+cd scanner-frontend && npm run dev
+```
+
+Both processes share `scandex.db`. That is safe because `ScannerDB` enables WAL
+mode — one writer, many readers. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#why-sqlite-and-why-wal-specifically).
+
+Without a secret, drop the indexer and add `--no-ledger`: the API still serves
+whatever is already in `scandex.db`, and `/health` reports a null
+`ledger_offset` with a note explaining why.
+
+### Pointing the frontend somewhere else
+
+The API base URL is **not** hardcoded. It comes from `VITE_API_BASE`, defaulting
+to `http://127.0.0.1:8787` — the port `serve_api.py` actually defaults to:
+
+```bash
+cd scanner-frontend
+cp .env.example .env.local
+echo 'VITE_API_BASE=http://127.0.0.1:8790' > .env.local   # e.g. a second server
+```
+
+`.env.local` is gitignored. Vite inlines `import.meta.env` at build time, so
+restart `npm run dev` after changing it. Switching between a test-mode and a
+real-mode backend is a config change, never a source edit.
+
+## Test mode vs real mode
+
+| | `--data-mode test` | `--data-mode real` (default) |
+|---|---|---|
+| Database | `scandex-test.db` | `scandex.db` |
+| Data source | `demo_data.py`, fabricated | whatever the indexer wrote |
+| Needs `C8_CLIENT_SECRET` | no | yes, for live drift |
+| Network access | **none** | ledger reads (unless `--no-ledger`) |
+| Indexer required | no | yes, to have any data |
+| Reported as | `data_mode: "test"` | `data_mode: "real"` |
+
+```bash
+python scripts/serve_api.py --data-mode test              # offline demo
+python scripts/serve_api.py --data-mode real              # live drift, needs the secret
+python scripts/serve_api.py --data-mode real --no-ledger  # local data only, no ledger calls
+```
+
+**Test mode guarantees.** The seeded data is deterministic (re-seeding rebuilds
+the same dataset rather than stacking a second copy) and **no network call is
+made**. That is structural, not a promise: `main()` never constructs a
+`LedgerClient` at all when `--data-mode test`, so there is no object on which a
+ledger call could be made. `tests/test_webapi_contract.py::TestModeIsOfflineTests`
+asserts exactly that, by failing if `build_ledger_client` is ever invoked in
+test mode.
+
+**Real mode guarantees.** Real mode never falls back to test data. On a ledger
+error it degrades `ledger_offset` to `null` with a `ledger_offset_note` — it
+does **not** change which SQLite file it reads.
+
+> **`--data-mode test` data is fabricated.** Every figure it serves is invented.
+> The UI labels it `Data mode: TEST` for exactly this reason — never present a
+> test-mode number as ledger data.
+
+**Real mode needs a secret you must request.** `C8_CLIENT_SECRET` is issued by
+the Cantor8 team; it is not in this repository and never should be.
+
+## Verification
+
+One command runs everything:
+
+```bash
+bash scripts/check_all.sh
+```
+
+It keeps going after a failure (so a lint error cannot hide a broken test) and
+prints a PASS/WARN/FAIL summary. `SKIP_FRONTEND=1` skips the Node steps.
+
+A clean run ends with:
+
+```
+══ summary ══
+  PASS  compile (python)
+  PASS  tests (pytest)
+  PASS  frontend lint
+  PASS  frontend tests
+  PASS  frontend build
+  WARN  cantor8 summary (no C8_CLIENT_SECRET)
+
+All required checks passed.
+```
+
+That `WARN` is expected on a clone with no secret configured — the live-ledger
+check is advisory and does not fail the script. Everything else is fully
+offline.
+
+The individual commands, if you prefer to run them one at a time:
+
+```bash
+python -m compileall src scripts tests      # syntax
+python -m pytest -q                          # backend tests (offline)
+python -m unittest discover -s tests         # same suite, no pytest needed
+python scripts/check_cantor8.py --summary    # live ledger; needs the secret
+
+cd scanner-frontend
+npm install
+npm run lint
+npm run test:run                             # vitest, offline
+npm run build
+```
+
+### End-to-end render check (needs a running backend)
+
+The frontend suite is offline by default. To assert that data actually reaches
+the DOM — the check that would have caught both integration bugs, since each
+returned HTTP 200 while rendering nothing:
+
+```bash
+# terminal 1
+python scripts/serve_api.py --data-mode test --port 8790
+# terminal 2
+cd scanner-frontend
+VITE_API_BASE=http://127.0.0.1:8790 npx vitest run src/e2e.render.test.jsx
+```
+
+It mounts the real `Dashboard` and `Status` components against the real server
+and asserts the party list, the 100/80/locked balance split, the transfer rows,
+the stale badge, the metrics panel and the data-mode chip all render. Without
+`VITE_API_BASE` set it skips itself, so `npm run test:run` and CI stay offline.
+
+## The nine features, and where each one lives
+
+| # | Feature | Backend | Route | Frontend |
+|---|---|---|---|---|
+| 1 | Wallet balance | `ScannerDB.get_balance` | `GET /tokens/balance/{party}` | Balance cards, `Dashboard.jsx` |
+| 2 | Spendable vs locked | `get_balance` (`total`/`spendable`), `get_holdings_raw` (`locked`) | same, plus `/tokens/holdings/{party}` | "N spendable" line + "N locked" chip per card |
+| 3 | Known parties | `get_parties` | `GET /parties` | Topbar party selector |
+| 4 | Transfer history | `get_transfers` | `GET /tokens/transfers/{party}` | Transfers panel, with instrument/direction filters |
+| 5 | SQLite persistence | `ScannerDB` + WAL | — | — (the file is the state; it survives restarts) |
+| 6 | Resume after restart | `get_offset` / `save_offset`, `Indexer`'s seed-vs-catch-up branch | — | — (backend only) |
+| 7 | Health / status | `get_health` (+ `data_mode`) | `GET /health` | `/status` page, and the topbar status chip |
+| 8 | Stale / pending transfers | `get_stale_transfers`, `DEFAULT_STALE_SECONDS` | `GET /tokens/transfers/stale` | "stale pending" badge on a row; full list on `/status` |
+| 9 | Metrics | `get_metrics` | `GET /metrics` | Scanner-metrics panel on `/dashboard`, and on `/status` |
+
+## Stack & design rationale
+
+Why SQLite and why WAL, why a scanner has to exist on Canton at all, why the
+data flows scanner → DB → API → frontend rather than the browser calling
+Cantor8, why the nine features are ordered as they are, and what is honestly
+mocked or limited:
+
+**→ [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
+
+## Deployment — what this is, and what it is not
+
+**This is a local-demo architecture.** It is not a deployment target, and this
+section will not pretend otherwise. As shipped:
+
+- the API binds `127.0.0.1` and has **no authentication**, no TLS and no rate
+  limiting;
+- it sends `Access-Control-Allow-Origin: *` on every response so any localhost
+  origin can call it during a demo;
+- state is a **single SQLite file** written by exactly one process;
+- the frontend is a static bundle (`npm run build` → `dist/`) that any static
+  host can serve, but it is useless without an API it can reach.
+
+Making this network-facing is not a configuration change. What it would take —
+auth, an allow-listed CORS origin, TLS and a real WSGI/ASGI server, moving off
+a single-writer SQLite file, and a retention policy for `ledger_events` — is
+spelled out in
+[docs/ARCHITECTURE.md § What this is not](docs/ARCHITECTURE.md#what-this-is-not-and-what-it-would-take).
+None of it is implemented.
+
 ## Safety — what this tool will never do on its own
 
 Under **any** flag, the diagnostic will never:
@@ -379,6 +588,11 @@ runs in CI. Even `--preview-transfer` only *analyses* a transfer and prints
   `ScannerDB` database schema (the single source of truth for the tables).
 - [docs/ENDPOINT_DATA_MAP.md](docs/ENDPOINT_DATA_MAP.md) — every Cantor8 endpoint
   Scandex reads, plus the local API Scandex serves to its own frontend.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — why the stack is shaped this
+  way: SQLite + WAL, why a scanner is necessary on Canton, the feature
+  ordering, and what is honestly mocked or limited.
+- [scanner-frontend/README.md](scanner-frontend/README.md) — the dashboard:
+  `VITE_API_BASE`, its routes, and its test setup.
 - [API.md](API.md) — tested endpoint cheat sheet.
 - [SETUP.md](SETUP.md) — LocalNet + Daml toolchain setup.
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — every real error and its fix.
