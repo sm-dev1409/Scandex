@@ -15,13 +15,14 @@ import sys
 
 from .auth import Authenticator
 from .config import load_config
-from .db import Database
 from .diagnostics import NOT_TESTED, Diagnostics
 from .errors import ConfigError, ScandexError
 from .http import HttpClient
 from .indexer import Indexer
 from .ledger import LedgerClient
 from .models import Outcome
+from .store import DEFAULT_STALE_SECONDS, ScannerDB
+from .webapi import serve
 
 _ICON = {
     Outcome.PASS: "PASS",
@@ -126,6 +127,19 @@ def build_parser() -> argparse.ArgumentParser:
                              "demos and tests.")
     parser.add_argument("--limit", type=int, default=25,
                         help="Rows to show for --history (default: 25).")
+    parser.add_argument("--stale-seconds", type=int, default=DEFAULT_STALE_SECONDS,
+                        metavar="SECONDS",
+                        help="Age past which a still-pending transfer counts as "
+                             f"stale (default: {DEFAULT_STALE_SECONDS}).")
+
+    # ---- local JSON API for the frontend (read-only) ----------------------
+    parser.add_argument("--serve", action="store_true",
+                        help="Serve the indexed data as a local JSON API for a "
+                             "frontend. Reads --db; never writes to it.")
+    parser.add_argument("--host", default="127.0.0.1", metavar="HOST",
+                        help="Bind address for --serve (default: 127.0.0.1).")
+    parser.add_argument("--port", type=int, default=8787, metavar="PORT",
+                        help="Port for --serve (default: 8787).")
     return parser
 
 
@@ -179,7 +193,7 @@ def _run_index(cfg, args) -> int:
     http = HttpClient(timeout=cfg.timeout)
     auth = Authenticator(cfg, http)
     ledger = LedgerClient(cfg, auth, http)
-    with Database(args.db) as db:
+    with ScannerDB(args.db, stale_seconds=args.stale_seconds) as db:
         indexer = Indexer(db, ledger, [party], logger=logger)
         try:
             if args.follow:
@@ -203,6 +217,8 @@ def _run_index(cfg, args) -> int:
             print(f"  holdings created  {stats.holdings_created}")
             print(f"  holdings archived {stats.holdings_archived}")
             print(f"  transfers logged  {stats.transfers_recorded}")
+            print(f"  offers created    {stats.offers_created}")
+            print(f"  offers resolved   {stats.offers_resolved}")
     return 0
 
 
@@ -210,8 +226,8 @@ def _run_balance(cfg, args) -> int:
     party = _resolve_party(cfg, args, "balance")
     if not party:
         return 2
-    with Database(args.db) as db:
-        rows = db.balance_for(party)
+    with ScannerDB(args.db, stale_seconds=args.stale_seconds) as db:
+        rows = db.get_balance(party)
         offset = db.get_offset()
     if args.as_json:
         print(json.dumps({
@@ -219,7 +235,7 @@ def _run_balance(cfg, args) -> int:
             "asOfOffset": offset,
             "byInstrument": [
                 {
-                    "instrument": r["instrument_id"],
+                    "instrument": r["instrument"],
                     "total": r["total"],
                     "spendable": r["spendable"],
                     "holdings": r["holding_count"],
@@ -237,7 +253,7 @@ def _run_balance(cfg, args) -> int:
     print(f"  {'instrument':<20} {'total':>14} {'spendable':>14} {'holdings':>10} "
           f"{'locked':>8}")
     for r in rows:
-        print(f"  {(r['instrument_id'] or '?'):<20} {r['total']:>14} "
+        print(f"  {(r['instrument'] or '?'):<20} {r['total']:>14} "
               f"{r['spendable']:>14} {r['holding_count']:>10} "
               f"{r['locked_count'] or 0:>8}")
     return 0
@@ -247,8 +263,8 @@ def _run_history(cfg, args) -> int:
     party = _resolve_party(cfg, args, "history")
     if not party:
         return 2
-    with Database(args.db) as db:
-        rows = db.transfers_for(party, limit=args.limit)
+    with ScannerDB(args.db, stale_seconds=args.stale_seconds) as db:
+        rows = db.get_transfers(party, limit=args.limit)
     if args.as_json:
         print(json.dumps({
             "party": party,
@@ -257,14 +273,15 @@ def _run_history(cfg, args) -> int:
                 {
                     "id": r["id"],
                     "updateId": r["update_id"],
+                    "contractId": r["contract_id"],
                     "sender": r["sender"],
                     "receiver": r["receiver"],
-                    "instrument": r["instrument_id"],
+                    "instrument": r["instrument"],
                     "amount": r["amount"],
                     "transferKind": r["transfer_kind"],
                     "status": r["status"],
                     "source": r["source"],
-                    "observedAt": r["observed_at"],
+                    "recordedAt": r["recorded_at"],
                 }
                 for r in rows
             ],
@@ -274,14 +291,48 @@ def _run_history(cfg, args) -> int:
     if not rows:
         print("  (no transfers recorded for this party yet)")
         return 0
-    print(f"  {'when':<21} {'kind':<7} {'instrument':<12} {'amount':>12} "
-          f"{'counterparty':<24} update_id")
+    print(f"  {'when (UTC)':<19} {'kind':<7} {'status':<9} {'instrument':<12} "
+          f"{'amount':>12} {'counterparty':<24} update_id")
     for r in rows:
         counterparty = r["receiver"] if r["sender"] == party else r["sender"]
         counterparty = (counterparty or "?")[:24]
-        print(f"  {r['observed_at']:<21} {(r['transfer_kind'] or '?'):<7} "
-              f"{(r['instrument_id'] or '?'):<12} {(r['amount'] or ''):>12} "
-              f"{counterparty:<24} {r['update_id'] or ''}")
+        print(f"  {_short_time(r['recorded_at']):<19} {(r['transfer_kind'] or '?'):<7} "
+              f"{(r['status'] or '?'):<9} {(r['instrument'] or '?'):<12} "
+              f"{(r['amount'] or ''):>12} {counterparty:<24} {r['update_id'] or ''}")
+    return 0
+
+
+def _short_time(value: str | None) -> str:
+    """ScannerDB stores full ISO-8601 with microseconds and a UTC offset, which
+    is right for the API but 32 characters wide in a terminal table. Trim to
+    seconds for display only."""
+    if not value:
+        return ""
+    return value.replace("T", " ")[:19]
+
+
+def _run_serve(cfg, args) -> int:
+    """Serve the indexed database over a local read-only JSON API.
+
+    The ledger client is optional but wired when a secret is configured, so
+    /health and /metrics can report real drift against the live ledger end.
+    Without it those fields degrade to null rather than failing the request.
+    """
+    ledger = None
+    if cfg.has_secret:
+        # A short timeout on purpose: /health and /metrics call ledger_end() on
+        # every request and must degrade to a null offset quickly rather than
+        # hanging the frontend when DevNet is slow or down.
+        http = HttpClient(timeout=min(cfg.timeout, 5.0))
+        ledger = LedgerClient(cfg, Authenticator(cfg, http), http)
+    else:
+        print("No C8_CLIENT_SECRET set: /health and /metrics will report a null "
+              "ledgerOffset (the local database is still served normally).")
+    with ScannerDB(args.db, stale_seconds=args.stale_seconds) as db:
+        try:
+            serve(db, host=args.host, port=args.port, ledger=ledger)
+        except KeyboardInterrupt:
+            print("\nStopped.")
     return 0
 
 
@@ -301,6 +352,8 @@ def main(argv=None) -> int:
         return _run_balance(cfg, args)
     if args.history:
         return _run_history(cfg, args)
+    if args.serve:
+        return _run_serve(cfg, args)
 
     diag = Diagnostics(cfg, verbose=args.verbose)
 

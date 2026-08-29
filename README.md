@@ -72,6 +72,10 @@ ledger.
 | `--write-report` | Writes timestamped JSON + Markdown reports into `reports/`. | `python scripts/check_cantor8.py --write-report` |
 | `--timeout <s>` | Per-request timeout in seconds (default 30). | `python scripts/check_cantor8.py --timeout 20` |
 | `--preview-transfer <from> <to> <amount> [--instrument Amulet]` | **Dry-run** analysis of a transfer. Submits **nothing**. | `python scripts/check_cantor8.py --preview-transfer alice bob 25` |
+| `--index [--follow]` | Run the A1 scanner: seed the active contract set, then stream updates into the local database. Read-only. | `python scripts/check_cantor8.py --index --follow --party alice::1220...` |
+| `--balance` | Print indexed balances for a party from the local database. | `python scripts/check_cantor8.py --balance --party alice::1220...` |
+| `--history` | Print indexed transfer history for a party. | `python scripts/check_cantor8.py --history --party alice::1220... --limit 25` |
+| `--serve [--port 8787]` | Serve the indexed database as a local JSON API for a frontend. See below. | `python scripts/check_cantor8.py --serve --port 8787` |
 
 Exit codes: `0` = all non-skipped checks passed · `1` = one or more failed ·
 `2` = configuration error (could not even start).
@@ -192,6 +196,165 @@ paths are healthy — never that the whole system is proven.
   rights, accepting/rejecting/withdrawing offers, and any `submit-and-wait`
   write. The tool never does these — see Safety.
 
+## Running the local API for the frontend
+
+The diagnostic answers "is Cantor8 reachable". The **scanner** answers "what do
+my parties actually hold, and what moved". It is two processes sharing one
+SQLite file:
+
+1. the **indexer** — reads the ledger and writes the database (one writer);
+2. the **API server** — serves that database as JSON on localhost (many readers).
+
+WAL mode is enabled on the database, which is what makes running both against
+one file safe. The API server never writes.
+
+### Start them side by side
+
+Terminal 1 — the indexer, following the ledger forever:
+
+```bash
+python scripts/check_cantor8.py --index --follow --tick 5 \
+    --party "myteam-dev-1::1220de..." --db scandex.db
+```
+
+Terminal 2 — the JSON API the frontend calls:
+
+```bash
+python scripts/serve_api.py --db scandex.db --port 8787
+```
+
+Both also work as installed console scripts (`check-cantor8 --index --follow`,
+`serve-scandex-api`), and the API can be started from the diagnostic CLI
+instead if you prefer one entry point: `python scripts/check_cantor8.py --serve
+--db scandex.db --port 8787`.
+
+First run seeds from the active contract set, so balances are correct
+immediately rather than starting at zero. Every run after that resumes from the
+saved offset — kill either process and restart it, nothing is lost and the ACS
+is never re-read.
+
+### Environment variables that matter
+
+| Variable | Needed by | Effect |
+|---|---|---|
+| `C8_CLIENT_SECRET` | indexer (required), API (optional) | Without it the indexer cannot read the ledger at all. The API still serves everything from the local database; only `/health` and `/metrics` lose their live `ledger_offset`, reporting `null` with a note. |
+| `C8_PARTY` | indexer | Default party to index; `--party` overrides it. |
+| `C8_BASE`, `C8_IDP`, `C8_CLIENT_ID`, `C8_USER` | indexer | Ledger and auth endpoints. See [.env.example](.env.example). |
+
+Other useful flags: `--db PATH` (default `scandex.db`), `--port` (default
+`8787`), `--host` (default `127.0.0.1`), and `--stale-seconds` (default `300`
+— how old a still-pending transfer must be to count as stale). Pass
+`--no-ledger` to `serve_api.py` to skip contacting the ledger entirely.
+
+### The routes
+
+| Method | Path | Answers |
+|---|---|---|
+| `GET` | `/health` | Is the scanner up, how far behind the ledger, how many stale transfers |
+| `GET` | `/parties` | Every party the scanner has seen |
+| `GET` | `/tokens/balance/{party}` | Balance per instrument: `total` vs `spendable` |
+| `GET` | `/tokens/holdings/{party}` | The individual holding contracts, with their `locked` flag |
+| `GET` | `/tokens/transfers/{party}` | Transfer history, newest first |
+| `GET` | `/tokens/transfers/stale` | Offers stuck `pending` past the threshold |
+| `GET` | `/tokens/owners` | Every known party and its balances |
+| `GET` | `/metrics` | Counts, per-instrument volume and locked totals, scanner delay |
+
+### Sample requests
+
+> The responses below come from a **seeded test database**, not a live DevNet
+> call. Party ids and contract ids are made up. Use them to see the shape of
+> the JSON, not as evidence of live data.
+
+```console
+$ curl -s http://127.0.0.1:8787/tokens/balance/alice::1220de
+{
+  "party": "alice::1220de",
+  "byInstrument": [
+    {
+      "instrument": "Amulet",
+      "total": 100.0,
+      "spendable": 80.0,
+      "holding_count": 3,
+      "locked_count": 1
+    }
+  ]
+}
+```
+
+`total` includes locked holdings; `spendable` does not. Here one 20-Amulet
+holding is locked, so 100 is held but only 80 can be spent.
+
+```console
+$ curl -s http://127.0.0.1:8787/tokens/transfers/stale
+{
+  "olderThanSeconds": 300,
+  "count": 1,
+  "transfers": [
+    {
+      "id": 3,
+      "update_id": "upd-91",
+      "contract_id": "ti-0c4",
+      "sender": "alice::1220de",
+      "receiver": "bob::9f31aa",
+      "amount": "5",
+      "instrument": "Amulet",
+      "transfer_kind": "offer",
+      "status": "pending",
+      "ledger_offset": "1044",
+      "recorded_at": "2026-08-29T16:22:32.801133+00:00",
+      "age_seconds": 929.0
+    }
+  ]
+}
+```
+
+That is the "nobody notices until a user complains" case: an offer that has sat
+unaccepted for 929 seconds.
+
+```console
+$ curl -s http://127.0.0.1:8787/health
+{
+  "status": "ok",
+  "scanner_offset": "1044",
+  "ledger_offset": null,
+  "scanner_delay_offsets": null,
+  "last_updated": "2026-08-29T16:37:32.801526+00:00",
+  "active_holdings": 5,
+  "archived_holdings": 0,
+  "total_transfers": 3,
+  "total_events": 5,
+  "tracked_parties": 2,
+  "stale_pending_transfers": 1,
+  "ledger_offset_note": "no ledger client configured (set C8_CLIENT_SECRET to report drift)"
+}
+```
+
+`ledger_offset` is `null` here because that server was started with
+`--no-ledger`. With a secret configured it carries the live ledger end and
+`scanner_delay_offsets` shows the real drift; if DevNet is unreachable the
+field degrades back to `null` with a note rather than taking the API down.
+
+An unknown party returns `404` with `{"error": "unknown party: ..."}`. A party
+the scanner knows but which holds nothing yet returns `200` with an empty list
+— a new account is a normal state, not an error.
+
+### Note for the frontend
+
+Import the database class from the **package path**, not as a bare module:
+
+```python
+from scandex_api.store import ScannerDB      # correct
+import store                                  # will not resolve
+```
+
+Most frontends should call the HTTP API rather than importing `ScannerDB` at
+all — one process writing and one reading is the arrangement WAL is designed
+for.
+
+**This server is for local demo use only:** no auth, no TLS, and a wildcard
+`Access-Control-Allow-Origin: *` on every response so any localhost origin can
+call it. Keep it bound to `127.0.0.1`.
+
 ## Safety — what this tool will never do on its own
 
 Under **any** flag, the diagnostic will never:
@@ -213,9 +376,9 @@ runs in CI. Even `--preview-transfer` only *analyses* a transfer and prints
 - [docs/TOOLKIT.md](docs/TOOLKIT.md) — the original Canton hackathon toolkit
   guide (the `c8lab.py` scratch tool and the six-step lab).
 - [docs/API_INTEGRATION.md](docs/API_INTEGRATION.md) — package design and the
-  recommended database schema.
-- [docs/ENDPOINT_DATA_MAP.md](docs/ENDPOINT_DATA_MAP.md) — every endpoint, what
-  it answers, and how it maps to the database.
+  `ScannerDB` database schema (the single source of truth for the tables).
+- [docs/ENDPOINT_DATA_MAP.md](docs/ENDPOINT_DATA_MAP.md) — every Cantor8 endpoint
+  Scandex reads, plus the local API Scandex serves to its own frontend.
 - [API.md](API.md) — tested endpoint cheat sheet.
 - [SETUP.md](SETUP.md) — LocalNet + Daml toolchain setup.
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — every real error and its fix.

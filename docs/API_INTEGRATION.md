@@ -18,8 +18,10 @@ src/scandex_api/
   scanner.py      scanner read API + public Scan API
   models.py       dataclasses: Party, Holding, Instrument, CheckResult, ...
   diagnostics.py  orchestrates checks, formats results, writes reports
-  db.py           sqlite3 wrapper: schema, offsets, holdings, transfers
+  store.py        ScannerDB: THE database class - schema, the write side the
+                  indexer drives, and the read side the API and CLI call
   indexer.py      A1 scanner: seed the ACS, poll /v2/updates/trees forward
+  webapi.py       the local JSON API this repo serves to its own frontend
   cli.py          argument parsing + human/JSON output (diagnostic + scanner)
 ```
 
@@ -49,124 +51,216 @@ The package is standalone. It does **not** import the root `c8lab.py`, and
 
 ## Schema
 
-SQLite is fine for the demo (the A1 challenge suggests it) and is what
-[`db.py`](../src/scandex_api/db.py) creates. Types below are SQLite-flavoured;
-use the obvious equivalents on Postgres. Tables the A1 scanner actively writes
-today are marked **[implemented]**; others are left as targets for the next
-extension (e.g. adding an instruments cache once the registry is wired into
-the indexer).
+One database class, one schema: **`ScannerDB`** in
+[`store.py`](../src/scandex_api/store.py). This is the single source of truth
+for the shape below, and the interface the frontend codes against by name:
 
-### `parties`  **[implemented]**
+```python
+from scandex_api.store import ScannerDB      # note the package path
+db = ScannerDB("scandex.db")
+db.get_balance(party_id)                     # not a bare `import store`
+```
+
+History: an earlier `db.py` (class `Database`) held a second, parallel schema
+for the same data. It has been **deleted**. Two of its properties were carried
+forward into `ScannerDB` rather than dropped — the idempotent transfer insert
+and the `transfers.status` column — both called out below. Nothing in the repo
+imports `db.py` any more; if you have a `scandex.db` file from before the merge,
+delete it (or call `ScannerDB.reset()`) and re-run the indexer. The schema is
+versioned in `schema_version` so a stale file is identifiable; current version
+is **3**.
+
+SQLite, standard library only. WAL mode is enabled on open — the indexer writes
+continuously while the HTTP API reads concurrently, and WAL is what keeps that
+from throwing "database is locked".
+
+### `checkpoint` — the restart bookmark
+
+Exactly one row (`CHECK (id = 1)`).
+
 | column | type | notes |
 |---|---|---|
-| `party_id` | TEXT PRIMARY KEY | full `hint::fingerprint` id |
-| `hint` | TEXT | the `word-word-n` prefix |
-| `is_local` | INTEGER | 1 if this node can submit for it |
-| `display_name` | TEXT NULL | |
-| `first_seen` | TEXT | ISO-8601 UTC |
-| `last_seen` | TEXT | ISO-8601 UTC |
+| `id` | INTEGER PK | always 1 |
+| `last_offset` | TEXT NOT NULL | last ledger offset applied |
+| `updated_at` | TEXT NOT NULL | ISO-8601 UTC |
 
-Index: `(is_local)`.
+`get_offset()` returning `None` is what makes `Indexer.run_once()` take the seed
+path; anything else takes the catch-up path. That is the whole
+resume-after-restart guarantee.
 
-### `instruments`
+### `parties`
+
 | column | type | notes |
 |---|---|---|
-| `instrument_id` | TEXT PRIMARY KEY | e.g. `Amulet`, `c8ETH` |
-| `name` | TEXT NULL | |
-| `administrator` | TEXT NULL | issuer party; DSO for Amulet |
-| `decimals` | INTEGER NULL | needed to format amounts |
-| `registry_base` | TEXT | which registry served it |
-| `raw_json` | TEXT | verbatim metadata payload |
+| `party_id` | TEXT PK | full `hint::fingerprint` id |
+| `display_name` | TEXT NULL | from `/v2/parties` metadata when available |
+| `is_local` | INTEGER NOT NULL | 1 if this node can submit for it |
+| `first_seen_at` | TEXT NOT NULL | ISO-8601 UTC |
+| `last_seen_at` | TEXT NOT NULL | refreshed on every sighting |
 
-### `holdings`  (current state; a UTXO set, not a number)  **[implemented]**
+Filled by the indexer from two places: `_seed` (every followed party, with
+`/v2/parties` metadata) and `_apply_tree` (any `owner` / `sender` / `receiver`
+discovered in a transaction — a counterparty is often not a party you follow).
+`save_party` never clobbers a known `display_name` with `None`.
+
+### `holdings` — current state; a UTXO set, not a number
+
 | column | type | notes |
 |---|---|---|
-| `contract_id` | TEXT PRIMARY KEY | the holding contract |
-| `party_id` | TEXT | FK → `parties` |
-| `amount` | TEXT | keep as string/decimal, not float |
-| `instrument_id` | TEXT | FK → `instruments` |
-| `administrator` | TEXT | issuer party |
-| `locked` | INTEGER | 1 if escrowed/locked |
-| `lock_expiry` | TEXT NULL | when the lock lifts |
-| `read_at_offset` | TEXT | ledger offset of the snapshot |
-| `observed_at` | TEXT | ISO-8601 UTC |
-
-Indexes: `(party_id, instrument_id)`, `(locked)`. Spendable = unlocked rows.
-
-### `contracts`  (generic active-contract cache, optional)
-| column | type | notes |
-|---|---|---|
-| `contract_id` | TEXT PRIMARY KEY | |
-| `template_or_interface` | TEXT | id string |
-| `party_id` | TEXT | witness party |
-| `created_at_offset` | TEXT | |
+| `contract_id` | TEXT PK | the holding contract |
+| `party_id` | TEXT NOT NULL | owner |
+| `amount` | TEXT NOT NULL | kept as a string, not a float |
+| `instrument` | TEXT NOT NULL | e.g. `Amulet`, `c8BTC` |
+| `admin` | TEXT NOT NULL | issuer party; DSO for Amulet |
+| `locked` | INTEGER NOT NULL | 1 if escrowed/locked |
+| `active` | INTEGER NOT NULL | 0 once archived; the row is kept |
+| `created_at_offset` | TEXT NULL | offset the create was seen at |
 | `archived_at_offset` | TEXT NULL | null while active |
-| `payload_json` | TEXT | verbatim |
+| `created_at` | TEXT NULL | ISO-8601 UTC |
+| `archived_at` | TEXT NULL | ISO-8601 UTC |
 
-### `transfers`  (history)  **[implemented]**
+Indexes: `(party_id, active)`, `(instrument, active)`. A balance is a `SUM` over
+`active = 1`; **spendable** excludes `locked = 1`. Archived rows are never
+deleted, so balance history can be reconstructed.
+
+### `ledger_events` — the audit trail
+
 | column | type | notes |
 |---|---|---|
-| `id` | INTEGER PRIMARY KEY AUTOINCREMENT | |
-| `update_id` | TEXT | ledger/scanner update id |
-| `sender` | TEXT | party |
-| `receiver` | TEXT | party |
-| `instrument_id` | TEXT | |
-| `amount` | TEXT | |
-| `transfer_kind` | TEXT | `direct` / `offer` / `self` |
-| `status` | TEXT | `settled` / `offered` / `accepted` / ... |
-| `source` | TEXT | `ledger` or `scanner` |
-| `scanner_delay_secs` | REAL NULL | recorded when `source='scanner'` |
-| `observed_at` | TEXT | ISO-8601 UTC |
+| `id` | INTEGER PK AUTOINCREMENT | |
+| `ledger_offset` | TEXT NOT NULL | |
+| `event_type` | TEXT NOT NULL | `created` / `archived` |
+| `contract_id` | TEXT NOT NULL | |
+| `template_id` | TEXT NULL | the Holding or TransferInstruction interface id |
+| `party_id` | TEXT NULL | |
+| `recorded_at` | TEXT NOT NULL | ISO-8601 UTC |
+| `raw_data` | TEXT NULL | JSON, **redacted** before storage |
 
-Indexes: `(sender)`, `(receiver)`, `(update_id)`.
+Indexes: `(ledger_offset)`, `(contract_id)`, `(party_id)`. `get_balance_history`
+replays these chronologically. Honest limitation: history starts when the
+scanner first ran, not at the beginning of the ledger.
 
-### `transfer_offers`  (pending offers, until accepted/rejected/withdrawn)
+### `transfers` — history, offers, and stale detection
+
 | column | type | notes |
 |---|---|---|
-| `instruction_cid` | TEXT PRIMARY KEY | the TransferInstruction contract |
-| `sender` | TEXT | |
-| `receiver` | TEXT | |
-| `instrument_id` | TEXT | |
-| `amount` | TEXT | |
-| `state` | TEXT | `pending` / `accepted` / `rejected` / `withdrawn` |
-| `created_at_offset` | TEXT | |
-| `observed_at` | TEXT | |
+| `id` | INTEGER PK AUTOINCREMENT | |
+| `update_id` | TEXT NULL | ledger update id |
+| `contract_id` | TEXT NULL | the holding leg, or the TransferInstruction offer |
+| `sender` | TEXT NULL | null on a `credit` leg |
+| `receiver` | TEXT NULL | null on a `debit` leg |
+| `amount` | TEXT NULL | string, not float |
+| `instrument` | TEXT NULL | |
+| `transfer_kind` | TEXT NULL | `credit` / `debit` / `offer` / `direct` |
+| `status` | TEXT NOT NULL | default `settled`; see below — **ported from `db.py`** |
+| `source` | TEXT NULL | `ledger` — **ported from `db.py`** |
+| `scanner_delay_secs` | REAL NULL | **ported from `db.py`**; reserved for scanner-sourced rows |
+| `ledger_offset` | TEXT NULL | |
+| `recorded_at` | TEXT NOT NULL | ISO-8601 UTC; drives staleness |
 
-### `ledger_offsets`  (resume points)  **[implemented]**
+Indexes: `(sender)`, `(receiver)`, `(update_id)`, `(status)`, `(contract_id)`.
+
+**`status`** is one of `settled` (an applied Holding movement), `pending` (an
+open `TransferInstruction` offer), or `resolved` (that offer was archived). The
+schema also permits `withdrawn` / `rejected`, but the indexer does not currently
+emit them — see the limitation under *TransferInstruction handling* below.
+
+**Idempotent inserts (ported from `db.py`, then fixed).** Two constraints,
+because one was not enough:
+
+1. `UNIQUE(update_id, sender, receiver, instrument, amount)` — the constraint
+   `db.py` had, carried forward verbatim.
+2. `idx_transfers_dedupe`, a unique index over the same identity with NULLs
+   coalesced to `''` and `contract_id` added.
+
+The second exists because SQLite treats NULLs as **distinct** in a UNIQUE index,
+so constraint 1 never fired for the indexer's per-leg rows — which deliberately
+carry a NULL `sender` (a credit) or a NULL `receiver` (a debit). Replaying an
+already-processed offset range, exactly what happens after a crash between
+recording a transfer and saving the checkpoint, therefore double-counted every
+leg. `contract_id` is in the key so that closing that hole does not create the
+opposite bug: one update legitimately crediting a party twice for the same
+amount is two contracts and must stay two rows.
+
+`save_transfer` swallows the resulting `IntegrityError` and returns `False` for
+"not newly inserted", the same contract `db.py`'s `insert_transfer` had.
+
+### `schema_version`
+
 | column | type | notes |
 |---|---|---|
-| `id` | INTEGER PRIMARY KEY | usually a single row per stream |
-| `stream` | TEXT | e.g. `acs` / `updates` |
-| `offset` | TEXT | last processed offset |
-| `observed_at` | TEXT | |
+| `version` | INTEGER PK | currently `3` |
 
-The A1 scanner saves its offset here and resumes from it after a restart instead
-of re-reading everything.
+### Dropped from `db.py`, deliberately
 
-### `service_health`  (operational health, time series)  **[implemented]** (empty schema; the diagnostic writes ad-hoc, no rows persisted yet)
-| column | type | notes |
-|---|---|---|
-| `id` | INTEGER PRIMARY KEY AUTOINCREMENT | |
-| `service` | TEXT | `ledger` / `registry` / `scanner` / `scan` |
-| `status` | TEXT | |
-| `db_status` | TEXT NULL | scanner only |
-| `scanner_delay_secs` | REAL NULL | scanner only |
-| `latency_ms` | REAL | |
-| `observed_at` | TEXT | |
+`instruments`, `contracts`, `transfer_offers`, `service_health`,
+`ledger_offsets` and `raw_api_responses` are gone. `ledger_offsets` is replaced
+by `checkpoint` (one stream, one bookmark). `transfer_offers` is replaced by
+`transfers` rows with `transfer_kind='offer'`, so an offer and its settlement
+live in one table and one query. The rest were never written by anything — an
+empty schema is worse than no schema, because it reads as a feature. Re-add
+them when something actually fills them.
 
-### `raw_api_responses`  (optional, for debugging)
-| column | type | notes |
-|---|---|---|
-| `id` | INTEGER PRIMARY KEY AUTOINCREMENT | |
-| `endpoint` | TEXT | |
-| `status_code` | INTEGER | |
-| `body_json` | TEXT | **redacted** before storage |
-| `observed_at` | TEXT | |
+## TransferInstruction handling and stale transfers
+
+The A1 scanner used to poll `/v2/updates/trees` with a Holding-only interface
+filter, which meant offer contracts never appeared in the trees at all. The
+filter now carries **both** the Holding and the TransferInstruction interface
+filters, so:
+
+- a **created** `TransferInstruction` becomes a `transfers` row with
+  `transfer_kind='offer'`, `status='pending'`, and the offer's contract id;
+- an **archived** `TransferInstruction` flips that row to `status='resolved'`.
+
+**Limitation, stated plainly:** the archive event alone does not reliably say
+whether the offer was accepted, rejected or withdrawn. Rather than guess, the
+indexer writes `resolved`. Distinguishing the three needs the exercised choice
+name (`TransferInstruction_Accept` / `_Reject` / `_Withdraw`) read out of the
+tree, which is a follow-up.
+
+`get_stale_transfers(older_than_seconds)` returns every row still `pending`
+whose `recorded_at` is older than the threshold — the "nobody notices until a
+user complains" problem from `CHALLENGES.md` (A2). The threshold is a
+parameter, not a constant: `ScannerDB(path, stale_seconds=...)`,
+`--stale-seconds` on both CLIs, or `?older_than_seconds=` on the endpoint. The
+count also surfaces in `get_health()` and `get_metrics()` as
+`stale_pending_transfers`.
+
+> **NOT VERIFIED LIVE.** The `TRANSFER_INSTRUCTION_INTERFACE` id in
+> [`ledger.py`](../src/scandex_api/ledger.py) follows the same naming pattern as
+> the confirmed Holding interface id, but was **not** confirmed against a live
+> DevNet response — no `C8_CLIENT_SECRET` was available in the environment that
+> wrote this. The same applies to the interface view's field layout
+> (`transfer.sender` / `receiver` / `amount` / `instrumentId`), which is read
+> defensively. Both carry `# TODO: verify against DevNet` comments. Check them
+> before demoing offer detection.
+
+## The transfer record shape: per-leg, not one row
+
+A settled transfer is recorded as **one row per leg** (`credit` / `debit`), not
+as a single `direct` row. Alice sending Bob 25 out of a 50 holding is three rows
+sharing an `update_id`: a `debit` of 50 from Alice (her holding archived), a
+`credit` of 25 to Bob, and a `credit` of 25 back to Alice as change.
+
+That is deliberate, and it is a real trade-off:
+
+- **For it:** it is what the ledger actually shows. A holding create/archive is
+  the event we observe; a "transfer" is our interpretation of several of them.
+  Per-leg rows also make partial application after a crash detectable — you can
+  see that one leg landed and another did not.
+- **Against it:** a frontend wanting "Alice → Bob, 25 Amulet" has to reassemble
+  it. `get_transfer_detail(update_id)` returns every leg of one transaction for
+  exactly that purpose.
+
+`transfer_kind='offer'` rows are the exception: a `TransferInstruction` really
+is a single sender→receiver record, so it is stored as one row.
 
 ## Normalise vs retain verbatim
 
-- **Normalise** the things you query and join on: parties, instruments (with
-  decimals), holdings (amount, instrument, locked), transfers, offsets.
+- **Normalise** the things you query and join on: parties, holdings (amount,
+  instrument, locked), transfers, and the checkpoint offset. Instrument
+  metadata (decimals, issuer) is not yet normalised - the registry is not
+  wired into the indexer, so `holdings.instrument` carries the id only.
 - **Retain verbatim** the payloads you cannot fully model yet: instrument
   metadata (`raw_json`), transfer-factory choice contexts and disclosed
   contracts, and anything you might need to replay. Store these as JSON text.
