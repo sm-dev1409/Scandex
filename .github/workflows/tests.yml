@@ -75,3 +75,30 @@ jobs:
         run: python -m pytest -q
       - name: Run tests (unittest fallback, offline)
         run: python -m unittest discover -s tests
+
+  frontend:
+    # The React dashboard: lint, unit tests and a production build. Fully
+    # offline - the Vitest suite stubs fetch, and the end-to-end render test
+    # (src/e2e.render.test.jsx) skips itself unless VITE_API_BASE points at a
+    # running server, which CI does not provide.
+    needs: secret-scan
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: scanner-frontend
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: scanner-frontend/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Unit tests (vitest, offline)
+        run: npm run test:run
+      - name: Production build
+        run: npm run build
